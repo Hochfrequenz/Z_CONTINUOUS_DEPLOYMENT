@@ -1,6 +1,6 @@
 # Continuous deployment into SAP development systems via abapGit — design
 
-Status: draft v3.4 for review. Date: 2026-09-28.
+Status: draft v3.5 for review. Date: 2026-09-28.
 
 Items marked **[pending]** are recommended defaults awaiting the maintainer's confirmation.
 
@@ -55,12 +55,16 @@ high frequency is cheap. A poll that finds nothing to do writes no log entry and
 (section 6.3):
 
 1. Acquire the lock. Not obtained → outcome `SKIPPED`, go to step 10 (nothing to write).
-2. Read the state row and resolve the repository by key.
+2. Read the state row and resolve the repository by key. If `ATTEMPT_ACTIVE` is still set, the
+   previous attempt did not finish (the lock was free, so nobody is running it): count it as
+   that attempt's failure with `failed_check` = `CRASHED` and `ATTEMPT_ERROR` = `crashed`, clear
+   `ATTEMPT_ACTIVE`, log "previous attempt did not finish" under the alert rule of 6.1a (it may
+   be the attempt that reaches the cap), and carry on.
 3. Ask the credential provider to make the token available (private repositories only).
 4. List the eligible tags (`TAG_SOURCE`) and choose the target (2.1).
 5. Decide (2.2) and check the attempt cap and back-off (6.1). The outcomes `NOTHING_TO_DO`
-   (including "waiting for back-off"), `BASELINED` and `FAILED` (cap reached) are terminal:
-   **go to step 9**. In `dry-run` mode the run logs what *would* happen (`DRY_RUN`, including
+   (including "waiting for back-off" and "attempt limit reached"), `BASELINED` and `FAILED` (a
+   poll error) are terminal: **go to step 9**. In `dry-run` mode the run logs what *would* happen (`DRY_RUN`, including
    "would baseline", "would wait for back-off" and "would stop: attempt limit reached") and goes to
    step 10, **before writing any state**. The "clean slate" test of 5.2 and `force_pull` are
    computed here, from the state row as read in step 2 — **before** the attempt marker of step 6
@@ -71,12 +75,12 @@ high frequency is cheap. A poll that finds nothing to do writes no log entry and
 7. Switch the repository to the tag — **always**, even if no pull is issued, because check 2 needs
    it — and deploy (`DEPLOYER`, 5.2).
 8. Verify (`VERIFIER`, section 5).
-9. Write the outcome state (6.2) and the log, then `COMMIT WORK`. **Every** path that ends a
-   repository, terminal or not, passes through this step, so a dump in a later repository cannot
-   lose the recorded outcome of an earlier one. After the commit, and **only in a run that
-   called `started` successfully in step 6**, report the verdict to the reporter (6.6; best effort —
-   a reporting failure never changes the outcome). Quiet polls, `BASELINED`, the attempt cap and
-   failures before step 6 make no reporter call at all: no GitHub request per repository per
+9. Write the outcome state (6.2) and the log, then `COMMIT WORK`. **Every** path except
+   `SKIPPED` and `DRY_RUN` (which go straight to step 10) passes through this step, so a dump in a later repository cannot
+   lose the recorded outcome of an earlier one. After the commit, and **in every run that reached step 6**, report the verdict to the reporter
+   (6.6; best effort — a reporting failure never changes the outcome; if `started` failed,
+   `finished` creates the deployment itself). Quiet polls, `BASELINED`, a capped tag and failures
+   before step 6 make no reporter call at all: no GitHub request per repository per
    minute, and no timeout to wait for when the API is unreachable.
 10. Release the lock. The release also runs in a cleanup handler; the enqueue is released by the
     system when the session ends.
@@ -114,6 +118,12 @@ promotion step and a clean rollback target.
   as ordinal strings, and with equal leading identifiers the shorter list is older. A suffix
   without dots, like `-rc10`, is one alphanumeric identifier and orders as a string (`-rc10` is
   older than `-rc2`); use `-rc.10` if numeric ordering matters. **[pending]**
+- **Suffix identifiers are validated.** A suffix is a list of identifiers separated by dots. A tag
+  is **skipped** if any identifier is empty (`-rc..1`) or if a purely numeric identifier has a
+  leading zero (`-rc.01`); otherwise two different tag names could have equal precedence. A numeric
+  identifier longer than nine digits is compared by length first and then as a string, so no
+  overflow can occur. A `+` has **no** build-metadata meaning: it is an ordinary character of an
+  alphanumeric identifier.
 - **Any suffixed tag is a deployable release**, and a suffixed tag with a higher `X.Y.Z` displaces a
   lower plain one: a stray `v9.0.0-test` becomes `D`, after which every real release below 9.0.0
   is "older" (row 7). Recovery is in 6.5. A stored `D` or `B` that no longer parses (someone edited
@@ -174,7 +184,7 @@ fakes.
 | `ZIF_CDEPLOY_REPORTER` | Publish deployment start and verdict to the outside (6.6); best effort | git host API |
 | `ZCL_CDEPLOY_RUN` | Orchestrate section 2 | all interfaces above |
 | `Z_CONTINUOUS_DEPLOYMENT` (report) | Batch entry point; parameter `dry-run` | `ZCL_CDEPLOY_RUN` |
-| `Z_CONTINUOUS_DEPLOYMENT_SETUP` (report) | Store/rotate/delete a credential; operator functions `RESET_ATTEMPTS`, `CLEAR_BASELINE` and `RESET_DEPLOYED` (6.5) | credentials class, state |
+| `Z_CONTINUOUS_DEPLOYMENT_SETUP` (report) | Store/rotate/delete a credential; operator functions `RESET_ATTEMPTS`, `CLEAR_SNAPSHOT` and `RESET_DEPLOYED` (6.5) | credentials class, state |
 | `Z_CONTINUOUS_DEPLOYMENT_STATUS` (report) | Read-only status list, one line per repository (6.6) | state |
 
 Production implementations: `ZCL_CDEPLOY_CONFIG_DB`, `ZCL_CDEPLOY_CREDS_SECSTORE`,
@@ -225,7 +235,9 @@ longest program: `Z_CONTINUOUS_DEPLOYMENT_STATUS`, 30 of 40); the check is repea
 |---|---|---|
 | `REPO_KEY` | abapGit repository key (12 characters) | Identity. Mirrors abapGit's own key type. |
 | `CRED_ID` | 40 characters | Reference to a stored PAT used to read the repository. Empty = public repository. |
-| `ENVIRONMENT` | 40 characters | Name under which this system appears in outward reporting (6.6). **Must be a neutral alias** ("dev-1", "team-a-dev"), never a system ID, host, client or customer name: on a public repository it is world-readable. Empty = no outward reporting. |
+| `ENVIRONMENT` | 40 characters | Name under which this system appears in outward reporting (6.6). **Must be a neutral alias** ("dev-1", "team-a-dev"), never a system ID, host, client or customer name: on a public repository it is world-readable.
+  The maintenance view rejects a value that equals or contains `SY-SYSID`, `SY-HOST` or `SY-MANDT`
+  of the current system. Empty = no outward reporting. |
 | `REPORT_CRED_ID` | 40 characters | Reference to a separate PAT allowed to write deployment status (6.6). Empty = no outward reporting. Setting only one of `ENVIRONMENT` / `REPORT_CRED_ID` counts as "reporting off" and produces a note. |
 | `REPORT_ON_PUBLIC` | flag | Allow outward reporting to a **public** repository. Default off (6.6). |
 | `DEPLOY_ON_FIRST_RUN` | flag | See 2.2. Default off. |
@@ -255,15 +267,21 @@ longest program: `Z_CONTINUOUS_DEPLOYMENT_STATUS`, 30 of 40); the check is repea
 | `DEPLOYED_AT` | Timestamp of the verified deployment. |
 | `FAIL_TAG` | Tag of the current attempt or failed attempt; empty if none. Set **before** the pull (5.1), so it also marks a crashed attempt. |
 | `FAIL_COUNT` | Attempts made for `FAIL_TAG`. |
-| `LAST_ERROR` | Last failure text, or `attempt in progress` while a pull runs. Never contains a credential. |
-| `LAST_ERROR_CLASS` | `ATTEMPT` (a deployment attempt, tied to `FAIL_TAG`), `REMOTE`, `AUTH`, `CONFIG`, or empty. Drives alert de-duplication (6.1a). |
-| `LAST_ERROR_AT` | UTC timestamp of it. |
-| `LAST_ALERT_AT` | UTC timestamp of the last time a failure was logged and set the error exit status (6.1a). |
+| `ATTEMPT_ACTIVE` | Flag: an attempt is running, or crashed. Set with the attempt marker; cleared by any verdict. If it is still set when a run gets the lock, the previous attempt did not finish (step 2). |
+| `ATTEMPT_AT` | UTC timestamp of the start of the latest attempt (written with the marker). Its age is how the status report tells a running attempt from a crashed one. |
+| `ATTEMPT_ERROR` | Failure text of the latest failed attempt for `FAIL_TAG` (`crashed` for a crashed one). Never contains a credential. Cleared only by a verified deployment. |
+| `ATTEMPT_CHECK` | The `failed_check` of that failure. Alert de-duplication compares it (6.1a). |
+| `ATTEMPT_ERROR_AT` | UTC timestamp of that failure. The back-off counts from it (6.1a). |
+| `POLL_ERROR_CLASS` | `REMOTE`, `AUTH`, `CONFIG` or empty: the error, if any, of the latest poll. A **separate slot** from the `ATTEMPT_*` fields, so a git outage cannot overwrite an attempt error and recovery cannot erase one. |
+| `POLL_ERROR` | Its text. Never contains a credential. |
+| `POLL_ERROR_AT` | UTC timestamp of the first occurrence in the current streak. |
+| `POLL_ALERT_AT` | UTC timestamp of the last time a poll error was logged and set the error exit status. |
 | `LAST_OUTCOME` | Run outcome of the most recent run that did something other than a quiet poll. For the status report. |
-| `LATEST_TAG` | Newest eligible tag seen at the last successful poll. For the status report. |
-| `LAST_NOTE_HASH` | Hash of the text of the current notes (skipped tags, re-pointed tag, withdrawn failed tag); a log entry is written only when it changes (2.2). |
+| `LATEST_TAG` | Newest eligible tag seen at the last successful listing. For the status report. |
+| `NOTES` | Text of the current notes (skipped tags, re-pointed tag, withdrawn failed tag), written together with its hash so the status report can show it without a remote call. |
+| `LAST_NOTE_HASH` | Hash of `NOTES`; a log entry is written only when it changes (2.2). Notes are computed only in runs whose tag listing succeeded. |
 | `LAST_POLL_AT` | Heartbeat: UTC timestamp of the last time the job processed this repository (whatever the outcome). |
-| `LAST_POLL_OK_AT` | Heartbeat: UTC timestamp of the last poll in which **tag listing succeeded**. An authentication failure is not success (it shows as `LAST_ERROR_CLASS` = `AUTH`). If this goes stale while `LAST_POLL_AT` is fresh, git is unreachable or rejecting us. |
+| `LAST_POLL_OK_AT` | Heartbeat: UTC timestamp of the last poll in which **tag listing succeeded**. An authentication failure is not success (it shows as `POLL_ERROR_CLASS` = `AUTH`). If this goes stale while `LAST_POLL_AT` is fresh, git is unreachable or rejecting us. |
 | `SNAP_TAKEN` | Flag: the inactive-object baseline has been taken for the current run of attempts. Set with the attempt marker; cleared only on `DEPLOYED` / `NO_CHANGE`. It, **not** the emptiness of `SNAP_INACTIVE`, decides whether a baseline exists — a clean package legitimately has zero inactive objects. |
 | `SNAP_INACTIVE` | Inactive objects at the start of the **first** attempt since the last verified deployment (string, one `TYPE NAME` per line; all users; restricted to the repository's package and its sub-packages). May be empty when `SNAP_TAKEN` is set. |
 
@@ -326,7 +344,7 @@ the repository's transport request.
 
 **The attempt marker.** In step 6, before the pull, the run writes `FAIL_TAG := target`,
 `FAIL_COUNT` +1 (1 for a new tag), `SNAP_TAKEN` and `SNAP_INACTIVE` (if not yet taken) and
-`LAST_ERROR := 'attempt in progress'`, then commits. On success these are cleared. If the process
+`ATTEMPT_ACTIVE` := X and `ATTEMPT_AT` := now, then commits. On success these are cleared. If the process
 dies mid-pull (short dump, cancelled job, killed work process), the marker is already committed:
 the next run sees `FAIL_TAG` = target, treats it as a retry, and still has the original inactive
 baseline. Without this, a crash would look like a fresh attempt whose snapshot already contains
@@ -392,7 +410,7 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 
 | Failure | Behaviour |
 |---|---|
-| Remote unreachable, TLS error | `FAILED` (class `REMOTE`); no tag known, so `FAIL_TAG` unchanged; `LAST_ERROR` updated; alert de-duplication applies (6.1a). |
+| Remote unreachable, TLS error | `FAILED` (class `REMOTE`); no tag known, so `FAIL_TAG` unchanged; `POLL_ERROR*` updated; alert de-duplication applies (6.1a). |
 | Authentication rejected, or `CRED_ID` set but no secure-store entry | `FAILED` (class `AUTH`); message names `CRED_ID`; as above. |
 | `REPO_KEY` unknown, repository offline or without URL; stored `D`/`B` no longer parses | `FAILED` (class `CONFIG`); as above. |
 | Config row inactive | Skipped silently. |
@@ -400,53 +418,73 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 | `LOCAL_CHANGES` or `NEEDS_DECISION` (5.2) | `FAILED` with the failed check; `FAIL_TAG` set; the ref may already be on the tag. |
 | Switch succeeds, pull raises | `FAILED`; `FAIL_TAG` set; the next run repeats (5.1). |
 | Pull "succeeds", verifier fails | `FAILED` with the failed check; as above. |
-| `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | Not pulled again. The attempt whose failure **made** `FAIL_COUNT` reach the cap logs "attempt limit reached" once and sets the error exit status once (it is that attempt's own failure). Every later poll is **quiet**: no log entry, no error status, only the heartbeat — `LAST_ERROR` keeps the real error and the status report shows the repository red (6.6). Stays so until a different tag becomes the target, or an operator intervenes (6.5). Bounds repeated partial pulls into a shared development system. **[pending]** |
+| `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | The attempt that made `FAIL_COUNT` reach the cap **always alerts** (log "attempt limit reached", error exit status), whatever the de-duplication says (6.1a). From then on each poll's outcome is `NOTHING_TO_DO` (capped): quiet, heartbeat only. The status report shows the repository red (6.6). It stays so until a different tag becomes the target, or an operator intervenes (6.5). Bounds repeated partial pulls into a shared development system. **[pending]** |
 | `FAIL_COUNT` below the cap, but the back-off has not elapsed | `NOTHING_TO_DO` (quiet), "waiting for back-off" (6.1a). |
 | Lock not obtained | `SKIPPED`; nothing written. |
 | Locked objects, unusable transport request, missing authorisation | `FAILED`; cause logged; `FAIL_TAG` set. |
-| Job cancelled, killed, or dumped mid-pull | The attempt marker (5.1) is already committed, so the next run retries against the original baseline. The enqueue lock is released when the session ends. A dump inside abapGit ends the whole job, so repositories after it are handled next run. |
+| Job cancelled, killed, or dumped mid-pull | The attempt marker (5.1) is already committed. The next run finds `ATTEMPT_ACTIVE` still set (step 2), logs "previous attempt did not finish" as that attempt's failure, and then retries after the back-off, against the original baseline. The enqueue lock is released when the session ends. A dump inside abapGit ends the whole job, so repositories after it are handled next run. |
 
 ### 6.1a Back-off and alert de-duplication
 
-At one poll per minute, retries and repeated failures would otherwise be hammered and flood the log
-and the job overview.
+At one poll per minute, retries and repeated failures would otherwise be hammered and flood the
+log and the job overview. Attempt errors and poll errors are separate slots (4.2) with separate
+rules.
 
-- **Back-off between attempts** of the same tag: after attempt *n* fails (or crashes), the next
-  attempt is not made before `LAST_ERROR_AT` plus a wait of 1, 2, 5, 10 minutes for *n* = 1, 2, 3, 4
-  and 10 minutes for any later *n*. **[pending]** With the default `MAX_ATTEMPTS` of 5, a transient
-  cause has about 18 minutes to clear before an operator is needed. A run that finds the back-off
-  not yet elapsed is `NOTHING_TO_DO` (quiet).
-- **Alert de-duplication.** A failure is *logged and sets the error exit status* (6.4) only if it is
-  new: its `LAST_ERROR_CLASS` differs from the recorded one, or at least 60 minutes have passed
-  since `LAST_ALERT_AT`. An identical repeat only updates the heartbeat. So a git-host outage
-  produces one log entry and one cancelled job, then one reminder per hour, and not one per minute.
-- A poll that reaches the remote successfully **clears** a recorded `REMOTE`, `AUTH` or `CONFIG`
-  error (`LAST_ERROR*` and the class), so recovery is visible; an `ATTEMPT` error is cleared only
-  by a verified deployment (6.2).
+**Back-off between attempts** of the same tag. After attempt *n* has failed or crashed, the next
+attempt is not made before `ATTEMPT_ERROR_AT` (which a crash detection sets, step 2) plus a wait of
+1, 2, 5, 10 minutes for *n* = 1, 2, 3, 4 and 10 minutes for any later *n*; for *n* = 0 (a fresh tag,
+or after `RESET_ATTEMPTS`) there is no wait. **[pending]** With the default `MAX_ATTEMPTS` of 5, a
+transient cause has about 18 minutes to clear before an operator is needed. A run inside the wait
+is `NOTHING_TO_DO` (quiet).
+
+**Alerting for attempt failures is deterministic and uses no clock.** An attempt failure is logged
+and sets the error exit status (6.4) if **any** of these holds, evaluated on the row as read in
+step 2:
+
+- it is the first failed attempt of this tag (`FAIL_COUNT` = 1, which restarts for every new tag,
+  so a new tag's first failure is never swallowed by the previous tag's alert);
+- it is the attempt that makes `FAIL_COUNT` reach `MAX_ATTEMPTS` (the cap is always announced);
+- its `failed_check` differs from `ATTEMPT_CHECK`.
+
+Otherwise (attempts 2 to 4 failing the same way) only state is written.
+
+**Alerting for poll errors** uses the class and a clock. A poll error is logged and sets the error
+exit status if its class differs from `POLL_ERROR_CLASS` as read in step 2, or at least 60 minutes
+have passed since `POLL_ALERT_AT`. So a git-host outage produces one log entry and one cancelled
+job, then one reminder per hour, not one per minute. `POLL_ERROR_AT` marks the start of the streak.
+
+**De-duplication suppresses only the log entry and the exit status. State is always written**, so
+back-off, the status report and the heartbeat stay accurate.
+
+**Clearing.** A poll clears `POLL_ERROR*` only if tag listing succeeded **and the run ended without
+an error of that class** (a stored `D` or `B` that does not parse is a `CONFIG` error found after a
+successful listing, and must not flip between cleared and raised every minute). `ATTEMPT_*` is
+cleared only by a verified deployment (6.2) and is never touched by poll errors or their recovery.
 
 ### 6.2 What each outcome writes to the state row
 
 | Outcome | Written | Not touched |
 |---|---|---|
-| row-3 prefix (2.2: `DEPLOY_ON_FIRST_RUN`) | `BASELINED` := X, `BASELINE_TAG` := empty — **written together with the fields of the outcome that follows** (attempt marker or `NOTHING_TO_DO`) | – |
-| `BASELINED` | `BASELINED`, `BASELINE_TAG` | everything else |
-| `NOTHING_TO_DO` (including waiting for back-off, and a capped tag on later polls) | the heartbeat (below), `LATEST_TAG`, `LAST_NOTE_HASH` if the notes changed, plus the row-3 prefix if it applies | everything else |
+| **every poll whose tag listing succeeded** (all outcomes below except `SKIPPED` and `DRY_RUN`) | `LAST_POLL_AT`, `LAST_POLL_OK_AT`, `LATEST_TAG`; `NOTES` and `LAST_NOTE_HASH` if the notes changed; clears `POLL_ERROR*` if the run ended without a poll error (6.1a) | – |
+| every other path through step 9 (listing failed) | `LAST_POLL_AT` only, plus `POLL_ERROR*` (below) | everything else |
+| row-3 prefix (2.2: `DEPLOY_ON_FIRST_RUN`) | `BASELINED` := X, `BASELINE_TAG` := empty — **written together with the fields of the outcome that follows** | – |
+| `BASELINED` | `BASELINED`, `BASELINE_TAG`, `LAST_OUTCOME` | `DEPLOYED_*`, `FAIL_*`, `ATTEMPT_*`, `SNAP_*` |
+| `NOTHING_TO_DO` (including waiting for back-off, and a capped tag on later polls) | nothing beyond the first row of this table, plus the row-3 prefix if it applies | everything else |
 | `SKIPPED` (lock busy) | **nothing** | everything |
-| `DRY_RUN` | **nothing**, not even a baseline or the heartbeat | everything |
-| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_TAKEN`, `SNAP_INACTIVE` if not yet taken, `LAST_ERROR := attempt in progress` | `DEPLOYED_*`, `BASELINE_*` |
-| `DEPLOYED`, `NO_CHANGE` | `DEPLOYED_TAG/COMMIT/AT`, `LAST_OUTCOME`; clear `FAIL_*`, `SNAP_*`, `LAST_ERROR*` | `BASELINE_*` |
-| `FAILED` after an attempt started | `LAST_ERROR*` := the actual error, class `ATTEMPT`, `LAST_OUTCOME`; `LAST_ALERT_AT` if it alerts (6.1a) | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `SNAP_*` |
-| `FAILED` without a target tag or before the marker was written (`REMOTE`, `AUTH`, `CONFIG`) | `LAST_ERROR*`, its class, `LAST_OUTCOME`, `LAST_ALERT_AT` if it alerts | everything else |
+| `DRY_RUN` | **nothing** (no state, no heartbeat, no log entry) | everything |
+| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_TAKEN`, `SNAP_INACTIVE` if not yet taken, `ATTEMPT_ACTIVE` := X, `ATTEMPT_AT` := now | `DEPLOYED_*`, `BASELINE_*`, `ATTEMPT_ERROR*` |
+| `DEPLOYED`, `NO_CHANGE` | `DEPLOYED_TAG/COMMIT/AT`, `LAST_OUTCOME`; clear `FAIL_*`, `SNAP_*`, `ATTEMPT_*` | `BASELINE_*`, `POLL_ERROR*` |
+| `FAILED` after an attempt started (or a crash detected in step 2) | clear `ATTEMPT_ACTIVE`; `ATTEMPT_ERROR`, `ATTEMPT_CHECK`, `ATTEMPT_ERROR_AT`, `LAST_OUTCOME`; the log entry and exit status follow the alert rule of 6.1a | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `SNAP_*`, `POLL_ERROR*` |
+| `FAILED` on a poll (`REMOTE`, `AUTH`, `CONFIG`) | `POLL_ERROR_CLASS`, `POLL_ERROR`, `POLL_ERROR_AT` (only if a new streak), `POLL_ALERT_AT` if it alerts, `LAST_OUTCOME` | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `ATTEMPT_*`, `SNAP_*` |
 
-**Heartbeat.** Every path through step 9 also writes `LAST_POLL_AT`, and `LAST_POLL_OK_AT` whenever
-tag listing in step 4 succeeded. `SKIPPED`, inactive rows and `DRY_RUN` do not write it. This is
-the only write a quiet poll makes besides `LATEST_TAG` and the note hash, so it is a single-row
-update.
+**Heartbeat.** `LAST_POLL_AT` is written on every path through step 9, `LAST_POLL_OK_AT` only when
+tag listing succeeded. A quiet poll is one single-row update carrying the heartbeat, `LATEST_TAG`
+and, only when they changed, the notes.
 
 "Deployed fields unchanged" is what "state unchanged" means throughout: a failed attempt never
 changes `DEPLOYED_*`. There is no push alerting (mail, chat) in v1; consumers read the outward
-status, the status report, the job overview, the application log, `FAIL_COUNT` and `LAST_ERROR`
-(6.6).
+status, the status report, the job overview, the application log, `FAIL_COUNT`, `ATTEMPT_ERROR` and
+`POLL_ERROR` (6.6).
 
 ### 6.3 Locking and rollback
 
@@ -486,31 +524,34 @@ final message aborts the job.
 The report ends with message type `E` if **any** repository ended `FAILED` *and that failure
 alerts under 6.1a* (a new failure, or a reminder after an hour), so the job appears as cancelled in
 the job overview once per problem and not once per minute. Runs with only `DEPLOYED`, `NO_CHANGE`, `NOTHING_TO_DO`,
-`BASELINED`, `SKIPPED` end normally. `dry-run` never sets the error status and never calls the
-deployer, but does contact the remote, read credentials and write log entries marked `DRY-RUN`. If
-a dry run meets a failure that a real run would hit (remote unreachable, bad credential, attempt
-limit reached), it logs "would fail: …" and, by the rule above, still ends normally: **for
-`dry-run`, "never sets the error status" wins over "E if any repository failed".**
+`BASELINED`, `SKIPPED` end normally. `dry-run` prints its plan to the spool and **writes nothing else**: no state, no heartbeat, no
+application-log entry, no reporter call. It does contact the remote and read credentials. If a dry
+run meets a failure that a real run would hit (remote unreachable, bad credential, attempt limit
+reached), it prints "would fail: …" and still ends normally: **for `dry-run`, "never sets the
+error status" wins over "E if any repository failed".**
 
 ### 6.5 Operator recovery
 
 Automatic recovery stops at the attempt cap by design. To resume a repository, an operator:
 
-1. Reads `LAST_ERROR` and the application log for the cause, and fixes it (for example activates
+1. Reads `ATTEMPT_ERROR` and the application log for the cause, and fixes it (for example activates
    or removes objects the failed attempt left inactive, or resolves the local changes).
 2. **Resets the attempt count** (`FAIL_COUNT` := 0) with the setup report's `RESET_ATTEMPTS`
    function. `FAIL_TAG` and the stored inactive baseline are kept, so the next attempt is still
    judged against the original baseline and cannot record a false success.
 3. If check 4 keeps failing only because *other developers* have made objects in the package
    inactive since the baseline was taken, and the operator has verified by hand that nothing left
-   inactive by the failed attempt remains, the setup report's `CLEAR_BASELINE` function clears
-   `FAIL_TAG`, `SNAP_TAKEN` and `SNAP_INACTIVE`. **This deliberately re-opens the false-success
+   inactive by the failed attempt remains, the setup report's `CLEAR_SNAPSHOT` function clears
+   `FAIL_TAG`, `FAIL_COUNT`, `ATTEMPT_*`, `SNAP_TAKEN` and `SNAP_INACTIVE`. **This deliberately re-opens the false-success
    risk for the next attempt** and is why it is a separate, explicit action.
 
-4. **A stray high tag** (for example someone pushes `v9.0.0-test`, which becomes `D` and makes every
-   real release below it "older"): delete the tag in git, then run the setup report's
-   `RESET_DEPLOYED`, which clears `DEPLOYED_TAG`, `DEPLOYED_COMMIT` and `DEPLOYED_AT`. The next
-   poll then follows rows 8 or 9 of the decision table and deploys the newest eligible tag.
+4. **A stray high tag** (for example someone pushes `v9.0.0-test`, which becomes `D` — or `B`, if it
+   already existed when the repository was baselined — and makes every real release below it
+   "older"): delete the tag in git, then run the setup report's `RESET_DEPLOYED`, which clears
+   `DEPLOYED_TAG`, `DEPLOYED_COMMIT`, `DEPLOYED_AT` **and `BASELINE_TAG`** (`BASELINED` stays set).
+   The next poll then follows row 8 of the decision table and deploys the newest eligible tag.
+   Pulling a real, older tag does **not** remove objects the stray tag had added; the operator
+   removes those by hand.
 
 A complete but unrecorded deserialisation (a crash after the last object, before the outcome was
 written) is recovered the same way; whether the retry can pass by itself depends on spike item 9.4.
@@ -534,10 +575,13 @@ monitoring. The layers, from most to least accessible:
      account**, not a person; and reporting to a public repository stays **off unless
      `REPORT_ON_PUBLIC` is set**. The reporter reads the repository's visibility from the API
      before its first call in a run and stays silent (with a note, 2.2) if it is public and the
-     flag is off.
+     flag is off. **It fails closed:** if the visibility lookup times out, errors, or answers 403 or
+     404, the repository counts as public and nothing is published. The technical account's
+     *name* is public too and must be neutral, like `ENVIRONMENT`. A private repository that later
+     becomes public exposes every past deployment (aliases, account, timing); that is documented.
    - **The payload is fixed and minimal:** `ref` = the tag, the environment alias, and as
      description only the `failed_check` value (an enumeration such as `INACTIVE`), or empty. Never
-     `LAST_ERROR`, object names, package names, host names or messages. No `log_url`,
+     `ATTEMPT_ERROR`, `POLL_ERROR`, object names, package names, host names or messages. No `log_url`,
      `environment_url` or `payload` field is set.
    - **API details.** Create deployment with `auto_merge` = false, `required_contexts` = an empty
      list (otherwise GitHub refuses with 409 when the tag's commit has red checks) and
@@ -552,9 +596,9 @@ monitoring. The layers, from most to least accessible:
      attempt, and no deployment id has to be stored.
    - **Best effort with a bound.** Every call has a timeout of 5 seconds. A reporting failure
      (network, token, rate limit) is logged and never fails or changes a deployment. `started`
-     makes at most four calls and `finished` at most three, so a repository is delayed by at most
-     seven times the timeout, and only on a real attempt: quiet polls make no reporter call at all
-     (step 9).
+     makes at most eight calls (visibility, list, at most two supersede calls, create, status)
+     and `finished` at most five, so a repository is delayed by at most about 65 seconds, and only
+     on a real attempt: quiet polls make no reporter call at all (step 9).
    - **GitHub (`github.com`) only.** The host is recognised from the repository URL; GitHub
      Enterprise and other hosts are out of scope for v1 and reporting is off for them.
      **[pending]**
@@ -564,21 +608,30 @@ monitoring. The layers, from most to least accessible:
 2. **Heartbeat.** `LAST_POLL_AT` and `LAST_POLL_OK_AT` (4.2). A monitor that sees `LAST_POLL_AT`
    stale knows the job is not running; one that sees only `LAST_POLL_OK_AT` stale knows git is
    unreachable. Both are shown in layer 3.
-3. **Status report `Z_CONTINUOUS_DEPLOYMENT_STATUS`.** A read-only list built **from the state
-   table alone** (no remote call, no credential), one line per repository: deployed tag, commit and
-   time (UTC), `LATEST_TAG`, `LAST_OUTCOME`, `FAIL_TAG` and `FAIL_COUNT`, `LAST_ERROR` and its
-   class, the current notes (2.2), both heartbeats, and a traffic-light column:
-   - **green:** `DEPLOYED_TAG` equals `LATEST_TAG`, no recorded failure, heartbeat fresh;
-   - **yellow:** an attempt in progress and younger than the in-progress threshold, or a baselined
-     repository with nothing deployed yet, or `LATEST_TAG` newer than `DEPLOYED_TAG` with no
-     failure (a deployment is due);
-   - **red:** failing or capped, `AUTH` / `REMOTE` / `CONFIG` error, heartbeat stale, or an attempt
-     "in progress" **older than the threshold** (that is what a crashed attempt looks like).
+3. **Status report `Z_CONTINUOUS_DEPLOYMENT_STATUS`.** A read-only list built from **the state table
+   and the configuration table** (`MAX_ATTEMPTS`, `ACTIVE`, `ENVIRONMENT`) — no remote call, no
+   credential. One line per repository: deployed tag, commit and time (UTC), `LATEST_TAG`,
+   `LAST_OUTCOME`, `FAIL_TAG` and `FAIL_COUNT`, `ATTEMPT_ERROR`, `POLL_ERROR` and its class, the
+   current `NOTES`, both heartbeats, and a traffic-light column. **Red beats yellow beats green.**
+   Let *running* mean `ATTEMPT_ACTIVE` is set and `ATTEMPT_AT` is younger than the in-progress
+   threshold:
+   - **red** if any of: `ATTEMPT_ACTIVE` set and `ATTEMPT_AT` older than the in-progress threshold
+     (a crashed attempt); `POLL_ERROR_CLASS` set; `FAIL_TAG` set and `ATTEMPT_ERROR` not empty
+     (failing, capped when `FAIL_COUNT` ≥ `MAX_ATTEMPTS`); or `LAST_POLL_AT` older than the
+     heartbeat threshold **and not *running*** (a long pull legitimately stops the heartbeat);
+   - **yellow** if not red and any of: *running*; or a deployment is due — the newest eligible tag
+     (`LATEST_TAG`) is newer than `DEPLOYED_TAG`, or, when nothing is deployed, newer than
+     `BASELINE_TAG` (or `BASELINE_TAG` is empty and a tag exists);
+   - **green** otherwise. This includes a baselined repository with nothing newer than the
+     baseline (the steady state), and a `LATEST_TAG` older than `DEPLOYED_TAG`.
 
-   Thresholds are report parameters: heartbeat stale after **3 minutes** by default, attempt in
-   progress stale after **30 minutes**. Runnable in the GUI and readable through ADT.
-4. **SAP job monitoring.** The job ends cancelled when any repository failed (6.4), so standard job
-   monitoring and any alerting built on it already fires.
+   Thresholds are report parameters: heartbeat stale after **3 minutes** by default, attempt
+   running stale after **30 minutes**. "Running" and "failing" are decided from the flag, the
+   timestamps and the counters, never by matching message text. Runnable in the GUI and readable
+   through ADT.
+4. **SAP job monitoring.** The job ends cancelled when a repository has a *new or reminded* failure
+   (6.4, 6.1a), so standard job monitoring and any alerting built on it already fires — once per
+   problem, not once per minute.
 5. **Application log `ZCDEPLOY`** for detail (SLG1). Only non-trivial outcomes are logged (6.4).
 
 The thresholds live in the status report, not in state.
@@ -597,14 +650,17 @@ The thresholds live in the status report, not in state.
   `-rc.10` beats `-rc.2` but `-rc10` does not beat `-rc2`; a numeric identifier is older than an
   alphanumeric one; a component above 2147483647 is skipped; equality of `T` and `D` is by parsed
   version and suffix
-- heartbeat: a quiet poll writes only `LAST_POLL_AT` / `LAST_POLL_OK_AT`, no log entry, empty
-  spool; an unreachable remote updates `LAST_POLL_AT` but not `LAST_POLL_OK_AT`
-- reporter: called only in a run that reached step 6 (never for quiet polls, `BASELINED`, the cap,
-  or failures before the marker); `started` is called after the commit; `finished` is called in
-  every run that called `started`, and creates the deployment itself if `started` failed; a
-  reporter that raises,
-  times out or errors never changes the outcome; the payload contains only tag, alias and
-  `failed_check`, never `LAST_ERROR`, object or package names; no reporter call and a note when the
+- heartbeat: a quiet poll writes only `LAST_POLL_AT`, `LAST_POLL_OK_AT`, `LATEST_TAG` and, if they
+  changed, the notes; no log entry, empty spool; an unreachable remote updates `LAST_POLL_AT` but
+  not `LAST_POLL_OK_AT`; notes are not recomputed when the listing failed, so an outage does not
+  flip the note hash
+- reporter: called only in a run that reached step 6 (never for quiet polls, `BASELINED`, a capped
+  tag, or failures before the marker); `started` is called after the commit; `finished` is called
+  in every run that reached step 6, and creates the deployment itself if `started` failed; a
+  reporter that raises, times out or errors never changes the outcome; the payload contains only
+  tag, alias and `failed_check`, never `ATTEMPT_ERROR`, object or package names; **the visibility
+  lookup failing (timeout, error, 403, 404) is treated as public: nothing is published**; no
+  reporter call and a note when the
   repository is public and `REPORT_ON_PUBLIC` is off; `ENVIRONMENT` without `REPORT_CRED_ID` (or
   the reverse) means reporting off with a note; a leftover `in_progress` deployment is marked
   `error` by the next `started`
@@ -613,13 +669,26 @@ The thresholds live in the status report, not in state.
 - every stored or printed timestamp is UTC `TIMESTAMPL` (the bare names are also forbidden by
   abaplint, 10)
 - back-off: after attempt *n* the next attempt waits 1, 2, 5, 10, 10 … minutes from
-  `LAST_ERROR_AT`; a run inside the wait is `NOTHING_TO_DO`; a crash waits the same way
-- alert de-duplication: an identical repeated failure neither logs nor sets the error status for
-  60 minutes; a different class does at once; a reminder follows after 60 minutes; a successful
-  poll clears a recorded `REMOTE` / `AUTH` / `CONFIG` error
+  `ATTEMPT_ERROR_AT`; *n* = 0 waits not at all; a run inside the wait is `NOTHING_TO_DO`; a crash
+  is detected in step 2, sets `ATTEMPT_ERROR_AT`, and waits the same way
+- attempt alerts: the first failure of a tag alerts, also within an hour of the previous tag's
+  alert; attempts 2 to 4 failing with the same `failed_check` do not; the attempt that reaches the
+  cap always alerts; a different `failed_check` alerts; state is written in every case
+- poll-error alerts: an identical repeated failure neither logs nor sets the error status for 60
+  minutes; a different class does at once; a reminder follows after 60 minutes; a successful poll
+  clears `POLL_ERROR*` only if the run ended without an error of that class (a stored `D` that no
+  longer parses does not flip between cleared and raised)
+- the two slots are independent: a git outage during a retrying or capped tag leaves `ATTEMPT_*`
+  intact, and its recovery does not clear them
+- crash detection: `ATTEMPT_ACTIVE` still set when a run gets the lock is logged as "previous
+  attempt did not finish", counts as a failed attempt (including the one that reaches the cap),
+  and the retry waits from the detection
 - notes are logged only when their hash changes
-- the status report colours: crashed attempt older than the threshold is red; a stale heartbeat is
-  red; a due deployment is yellow; it uses no remote call
+- the status report (state and config table only, no remote call): red beats yellow beats green;
+  a crashed attempt older than the threshold is red; a stale heartbeat is red **except** while an
+  attempt is running (a long pull); `POLL_ERROR_CLASS` set is red; capped is red; a due deployment
+  is yellow; a baselined repository with nothing newer, and a `LATEST_TAG` older than
+  `DEPLOYED_TAG`, are green; "running" is decided from the flag and timestamps, not from text
 - each verifier check fails on its own and yields the right `failed_check`
 - `NO_CHANGE` requires checks 2–4, is only possible on a clean slate, and only the verifier
   produces it
@@ -629,33 +698,33 @@ The thresholds live in the status report, not in state.
 - **zero-inactive baseline:** the package has *no* inactive objects at the first attempt, the
   attempt leaves some, the retry must be `FAILED` (`INACTIVE`) — `SNAP_TAKEN`, not emptiness of
   `SNAP_INACTIVE`, decides that a baseline exists
-- **crash path:** a fake that dies after the attempt marker is committed leaves `FAIL_TAG` set, so
-  the next run is a retry with the original `SNAP_INACTIVE`, never a fresh attempt
+- **crash path:** a fake that dies after the attempt marker is committed leaves `FAIL_TAG` and
+  `ATTEMPT_ACTIVE` set, so the next run is a retry with the original `SNAP_INACTIVE`, never a
+  fresh attempt
 - **a newer tag after a failed one:** the baseline is kept, `FAIL_TAG`/`FAIL_COUNT` restart, leftovers
   of the earlier tag are still reported by check 4, and the pull is **forced** even when the
   status is empty (`force_pull`), so the result cannot be `NO_CHANGE`
 - `LOCAL_CHANGES` / `NEEDS_DECISION` on a forced pull → no pull issued
-- attempt cap: the attempt that makes `FAIL_COUNT` reach `MAX_ATTEMPTS` logs "attempt limit
-  reached" once and alerts once; every later poll makes no deployer call, writes only the
-  heartbeat, logs nothing and sets no error status (`LAST_ERROR` unchanged); `MAX_ATTEMPTS` 0
-  behaves as 5
-- terminal outcomes (`BASELINED`, `NOTHING_TO_DO`, cap) pass through step 9 and are committed
+- attempt cap: the attempt that makes `FAIL_COUNT` reach `MAX_ATTEMPTS` always alerts (log "attempt
+  limit reached", error status); every later poll is `NOTHING_TO_DO` (capped): no deployer call,
+  only the poll heartbeat, no log entry, no error status, `ATTEMPT_ERROR` unchanged;
+  `MAX_ATTEMPTS` 0 behaves as 5
+- terminal outcomes (`BASELINED`, `NOTHING_TO_DO` including a capped tag, poll errors) pass through step 9 and are committed
   before the next repository is processed
 - a repository with `FAIL_TAG` set is processed after those without
 - a withdrawn failed tag adds the "partly at `FAIL_TAG`" note (logged once)
-- `RESET_ATTEMPTS`, `CLEAR_BASELINE` and `RESET_DEPLOYED` each change exactly the fields 6.5 names;
+- `RESET_ATTEMPTS`, `CLEAR_SNAPSHOT` and `RESET_DEPLOYED` each change exactly the fields 6.5 names;
   after `RESET_DEPLOYED` the next poll deploys the newest eligible tag (a stray `v9.0.0-test`
   scenario)
 - a stored `D` or `B` that no longer parses → `FAILED` (`CONFIG`)
-- `SKIPPED` and `DRY_RUN` write nothing; `NOTHING_TO_DO` writes only heartbeat, `LATEST_TAG` and
-  the note hash
+- `SKIPPED` and `DRY_RUN` write nothing; `NOTHING_TO_DO` writes only what the first row of 6.2 lists
 - state writes match the table in 6.2 for every outcome
 - unattended policy: overwrite required → `LOCAL_CHANGES`, no pull issued; other decision →
   `NEEDS_DECISION`
 - lock not obtained → `SKIPPED`; `ACTIVE` off → skipped
 - one repository throws → the others still run; exit status is error iff any failed
-- `dry-run` → deployer not called, no state written (not even a baseline; logged as "would
-  baseline"), entries marked
+- `dry-run` → deployer, reporter and log not called; no state written (not even a baseline or the
+  heartbeat); the plan is printed to the spool ("would baseline", "would wait for back-off")
 - state and log are committed per repository: a fake that dumps on repository N leaves 1..N-1
   recorded
 - **a credential never appears in any log message, state field or exception text**, asserted over
