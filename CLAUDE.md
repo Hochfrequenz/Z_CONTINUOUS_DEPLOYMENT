@@ -2,7 +2,7 @@
 
 Project-specific guidance for AI agents working in a repository created from this template. Read this alongside [README.md](README.md).
 
-This file is part of the template and gets copied into every new project. Adjust it to your project's real constraints (package name, system, style) after you create the repo.
+This file started as part of the repository template; the project-specific notes at the bottom are filled in.
 
 ## What this repo is
 

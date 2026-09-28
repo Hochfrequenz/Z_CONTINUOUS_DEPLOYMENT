@@ -11,7 +11,7 @@ that changes often. Last updated: 2026-09-29.
 | Plans 00 (overview), 01 (spike), 02 (core engine) | On `main`: `docs/superpowers/plans/` |
 | Plans 03 (adapters), 04 (reporter and reports) | **Outlines only**, inside plan 00. Deliberately not detailed until the spike has answered its questions. |
 | Implementation | **None.** No object exists on any system, `src/` does not exist yet. |
-| abaplint CI (PR #3) | May still be open. It is the prerequisite of plan 02's "lint like CI" steps. Check `gh pr list`. |
+| abaplint CI | **Merged**: `abaplint.json`, `package.json`, `.github/workflows/abaplint.yml`, `.github/dependabot.yml`. The lint steps are skipped while `src/` holds no ABAP objects and enforce from the first one. |
 | Decisions taken | Overwrite policy per repository, default `ALWAYS`; older ABAP releases in scope; GitHub (`github.com`) only. |
 | Still `[pending]` in the spec (defaults are implemented, each is one method to change) | suffix ordering; first run baselines only; `MAX_ATTEMPTS` 5 with back-off; transport request from abapGit's own setting |
 
@@ -29,7 +29,7 @@ defects on the first run; the red/green steps exist for that.
 
 ## 2. Next actions, in order
 
-1. **Merge or review PR #3** (abaplint pipeline) if it is still open.
+1. **Check `gh pr list`** for anything opened since this file was last updated. Nothing was open when it was written.
 2. **Fold overview section 4 findings 1 to 3 into the spec** in a small spec PR - *before* implementing
    plan 02, or the code will contradict the spec (plan 02, Task 0, Step 0).
 3. **Ask the maintainer** (see section 3) before touching a system.
@@ -44,15 +44,15 @@ defects on the first run; the red/green steps exist for that.
   request without permission. Pass the request, not the task.)
 - Whether to create the fixtures of spike task S0 (a public and a private GitHub fixture repository, tags,
   two fine-grained PATs stored by the maintainer, never by an agent).
-- Whether running the unit tests on a system is wanted now. It was **declined once to save tokens**; only
-  short probe snippets were run.
+- Whether running the unit tests on a system is wanted now. Per the maintainer it was **declined once to save
+  tokens**; only short probe snippets were run.
 - Anything that is token-expensive: the maintainer wants to be asked first.
 
 ## 4. Working rules (they come from the maintainer; the spec's section 10 has the same)
 
 - **Squash merge only.** An agent runs at least one round with a *separate* review agent before a pull
-  request is marked ready; until then it stays a draft. Re-review your own fixes: fixes made after a review
-  round introduced new defects every time so far.
+  request is marked ready; until then it stays a draft. Re-review your own fixes: in this project's review
+  rounds, fixes made after a round introduced new defects more than once.
 - Credentials are **PATs, never passwords**. Only tagged versions are deployed. Timestamps are UTC
   `TIMESTAMPL`, never `sy-datum`/`sy-uzeit`. Respect DDIC length limits (classes and interfaces 30, tables and
   lock objects 16) - a too-long test method name is the most common failure.
@@ -68,8 +68,7 @@ without asking the maintainer first.
 
 - The ADT loop is in plan 00, section 3. `mcp__sap-adt__export_package` needs the companion export package on
   the system.
-- **abaplint** (`abaplint.json` exists only once the abaplint CI pull request, #3, is merged) runs only the rules
-  listed in it, needs `dependencies` to know any standard class, and its `object_naming` patterns lose a
+- **abaplint** (`abaplint.json`) runs only the rules listed in it, needs `dependencies` to know any standard class, and its `object_naming` patterns lose a
   backslash (use character classes). Details are comments in that file.
 - **Short snippets on a real system are cheap and worth it** (plan 00, section 4a): one throwaway class in the
   local package implementing `IF_OO_ADT_CLASSRUN`, run with `mcp__sap-adt__run_class`, then deleted and
