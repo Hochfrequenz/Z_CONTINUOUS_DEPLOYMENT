@@ -1,0 +1,44 @@
+name: abaplint
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Read-only: the job only lints. No token is passed to any step.
+permissions:
+  contents: read
+
+jobs:
+  abaplint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # abaplint exits with an error ("No files found") when src/ holds no ABAP
+      # objects at all, which is this repository's state until the first object
+      # is serialised by SAP. Skip instead of failing every pull request; the
+      # moment src/ contains an object, the steps below run and enforce. XML
+      # counts too, so a change that only adds DDIC objects (tables, lock
+      # objects) is linted as well.
+      - name: No ABAP sources yet
+        if: ${{ hashFiles('src/**/*.abap', 'src/**/*.xml') == '' }}
+        run: echo "::notice::No ABAP sources under src/ yet; abaplint skipped."
+
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('src/**/*.abap', 'src/**/*.xml') != '' }}
+        with:
+          node-version: 20
+
+      # The abaplint CLI is called directly, not through abaplint/actions-abaplint:
+      # that action ignores abaplint's exit code and reports through a separate
+      # check run, so the job stayed green whatever the lint found. Here the
+      # step fails the job when abaplint finds issues.
+      #
+      # Version pinned: a new abaplint release must not change what passes on
+      # its own. Bump it in a pull request that shows the effect.
+      - name: abaplint
+        if: ${{ hashFiles('src/**/*.abap', 'src/**/*.xml') != '' }}
+        run: npx --yes @abaplint/cli@2.120.60 abaplint.json

@@ -1,0 +1,81 @@
+{
+  "global": {
+    "files": "/src/**/*.*"
+  },
+  "syntax": {
+    "version": "v740sp08",
+    "errorNamespace": "^(Z|Y).*$"
+  },
+  "rules": {
+    "parser_error": true,
+    "check_syntax": true,
+    "method_implemented_twice": true,
+    "unreachable_code": true,
+    "unused_variables": true,
+    "obsolete_statement": true,
+    "when_others_last": true,
+    "sql_escape_host_variables": true,
+    "identical_form_names": true,
+    "line_length": {
+      "length": 160
+    },
+    "object_naming": {
+      "clas": "^ZC[LX]_CDEPLOY_[A-Z0-9_]{1,18}$",
+      "intf": "^ZIF_CDEPLOY_[A-Z0-9_]{1,18}$",
+      "tabl": "^Z_CDEPLOY_[A-Z0-9_]{1,6}$",
+      "enqu": "^EZ_CDEPLOY[A-Z0-9_]{0,6}$",
+      "prog": "^Z_CONTINUOUS_DEPLOYMENT(_[A-Z0-9_]{1,16})?$"
+    },
+    "forbidden_identifier": {
+      "check": [
+        "^[/A-Za-z<][/A-Za-z0-9_<>]{30,}$",
+        "^(datum|uzeit|datlo|timlo)$"
+      ]
+    }
+  },
+  "_comment_syntax_version": [
+    "v740sp08 is the lowest ABAP release this tool targets, so nothing newer",
+    "than 7.40 SP08 may be used. It is a floor, not the release of any one",
+    "system.",
+    "",
+    "The pin only has an effect through parser_error and check_syntax.",
+    "abaplint runs ONLY the rules that are listed in this file, so both are",
+    "listed on purpose: without them, code that is not ABAP at all passes."
+  ],
+  "_comment_keyword_case": [
+    "keyword_case is deliberately NOT enabled. Objects are authored through",
+    "ADT and SAP's Class Builder regenerates the DEFINITION section of every",
+    "global class in its own canonical style on activation, so enforcing a",
+    "casing convention on code SAP rewrites only produces churn."
+  ],
+  "_comment_object_naming": [
+    "Enforces the naming scheme AND the DDIC length limits in one place:",
+    "classes and interfaces at most 30 characters, tables and lock objects",
+    "at most 16, programs at most 40. Written with explicit character",
+    "classes on purpose: abaplint drops the backslash of \\w in these",
+    "patterns, which silently turns them into a literal 'w'.",
+    "",
+    "A user-supplied object_naming block REPLACES abaplint's defaults, so",
+    "object types that are not listed here (function groups, data elements,",
+    "domains, message classes, transactions) are not checked at all. Add a",
+    "pattern when the first such object appears.",
+    "",
+    "There is no pattern for the package: abaplint takes the package name",
+    "from the file name package.devc.xml, so it always sees 'PACKAGE'.",
+    "The package name is checked in review. The tabl pattern also covers",
+    "structures, which DDIC would allow up to 30 characters."
+  ],
+  "_comment_forbidden_identifier": [
+    "First pattern: the 30-character identifier cap. ABAP rejects a longer",
+    "name at compile time, which surfaces as a hard error after a full SAP",
+    "round trip, while abaplint is otherwise clean on the same file.",
+    "",
+    "Second pattern: no sy-datum, sy-uzeit, sy-datlo, sy-timlo. Every",
+    "timestamp is an explicit UTC TIMESTAMPL. abaplint sees the component",
+    "token, not 'sy-datum', so this matches the bare names DATUM, UZEIT,",
+    "DATLO and TIMLO anywhere - it also flags an unrelated component of one",
+    "of those names. That is a known false positive; give such a component",
+    "another name. It cannot check that a timestamp is really a TIMESTAMPL;",
+    "that is a review item. Patterns are case-insensitive."
+  ]
+}
