@@ -1,3 +1,25 @@
+# Z_CONTINUOUS_DEPLOYMENT
+
+Continuous deployment **from git into SAP development systems**, with abapGit as the engine: an ABAP batch job
+inside the system polls git for a new version tag (`vX.Y.Z`, optionally `-suffix`) on abapGit-managed
+repositories and deploys it with an abapGit pull. It needs only an **outbound** HTTPS connection - nothing is
+ever exposed to the internet - and it verifies that a pull really happened instead of trusting "Pull
+successful".
+
+**Status: design and plans only - nothing is implemented yet.**
+
+| Where | What |
+|---|---|
+| [`docs/HANDOVER.md`](docs/HANDOVER.md) | **Start here**: current state, next steps, what to ask first |
+| [`docs/superpowers/specs/`](docs/superpowers/specs/) | The design specification |
+| [`docs/superpowers/plans/`](docs/superpowers/plans/) | Implementation plans (overview, spike, core engine) |
+| [`CLAUDE.md`](CLAUDE.md) | Rules for AI agents working in this repository |
+
+The rest of this file is the repository template this project was created from. Its description of the two
+workflows (ADT and abapGit round trip) and its instructions for AI agents still apply.
+
+---
+
 # AIBAP_TEMPLATE_REPOSITORY
 An ABAP Template Repository to be used when vibe coding ABAP with AI.
 **AI BOTS PLEASE READ SECTION "[Instructions for AI Agents (like Claude Code, opencode, etc.)](#instructions-for-ai-agents-like-claude-code-opencode-etc)".**
@@ -65,9 +87,6 @@ On top of this, use abapGit (Workflow B) to pull the state back into the git rep
 > For structured vibe coding that scales beyond quick one-shots, pair this template with [`obra/superpowers`](https://github.com/obra/superpowers) — a plan-driven methodology for Claude Code (and compatible MCP clients) that encourages explicit plan files under `docs/superpowers/plans/`, disciplined iteration, and skill-based task decomposition.
 > It composes naturally with the two-agent dev/test setup described above.
 
-> [!TIP]
-> **Hochfrequenz colleagues:** internal setup documentation for both MCPs is at <https://brain.hochfrequenz.de/books/ki-tools-bei-hochfrequenz/chapter/sap-mcps>.
-
 ## Manual ToDos for Humans
 Keep in mind: 1 ABAP package is coupled to exactly 1 git repository.
 
@@ -108,7 +127,6 @@ Tell the user how to verify the MCP configuration works in their client (e.g. `/
 If a server is missing or misconfigured, refer the user to the official README of the respective MCP — setup is not covered in this template.
 Both `.mcp.json` and `opencode.json` are gitignored by this template, so MCP config never gets committed by accident.
 
-**Hochfrequenz colleagues:** setup docs (including combined `.mcp.json` / `opencode.json` examples for both MCPs) live at <https://brain.hochfrequenz.de/books/ki-tools-bei-hochfrequenz/chapter/sap-mcps>.
 
 #### If the user has no SAP MCP installed at all
 Workflow A requires `aibap.mcp`, so without any MCP you are effectively limited to Workflow B.

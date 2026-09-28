@@ -64,10 +64,21 @@ Keep commits reviewable: one logical change per commit, descriptive message, and
 
 ## Project-specific notes
 
-<!-- Fill these in for your concrete project: -->
+Start with `docs/HANDOVER.md`: where things stand, what to do next, and what to ask the maintainer first.
 
-- **Package:** `<ZYOUR_PACKAGE>`
-- **System(s):** `<dev>`, `<qa>`, `<prod>`
-- **Style:** Clean ABAP / house style / mixed
-- **Test coverage expectations:** e.g. "all classes in `src/` must have an ABAP Unit test"
-- **Transport discipline:** e.g. "one TR per PR", "share TR `ABCK000123`"
+- **What this is:** an ABAP batch job inside an SAP development system that polls git for new `vX.Y.Z` tags on
+  abapGit repositories and deploys them with an abapGit pull. Spec: `docs/superpowers/specs/`. Plans:
+  `docs/superpowers/plans/`.
+- **Package:** `Z_CONTINUOUS_DEPLOYMENT` (customer namespace). Object prefix `CDEPLOY`; the naming scheme and the
+  DDIC length limits are enforced by `abaplint.json`.
+- **System(s):** an older and a newer system, development only. Their names are deliberately not in this
+  (public) repository. Develop on the older one first (the language floor is ABAP 7.40 SP08), then pull into the
+  newer one with abapGit and compare unit-test counts.
+- **Style:** Clean ABAP, lower-case file names, keywords as SAP serialises them (do not fight the Class Builder).
+- **Test coverage expectations:** every class in `src/` has ABAP Unit tests; logic is testable without abapGit,
+  a database, the network or the clock (they sit behind interfaces).
+- **Transport discipline:** ask which workbench request to use; pass the request, not the task; **never release
+  a request** without explicit permission.
+- **Pull requests:** squash merge only; a separate review agent runs at least once before a PR is marked ready.
+- **Public repository:** no system names, hosts, clients, customer or person names, tokens, or names of private
+  repositories anywhere.
