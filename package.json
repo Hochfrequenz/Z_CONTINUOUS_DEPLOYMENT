@@ -1,0 +1,8 @@
+{
+  "name": "z-continuous-deployment-tooling",
+  "private": true,
+  "description": "CI tooling for this repository (abaplint). Not part of the ABAP code.",
+  "devDependencies": {
+    "@abaplint/cli": "2.120.60"
+  }
+}
