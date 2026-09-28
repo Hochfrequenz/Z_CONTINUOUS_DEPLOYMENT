@@ -1,6 +1,6 @@
 # Continuous deployment into SAP development systems via abapGit — design
 
-Status: draft v3.6 for review. Date: 2026-09-28.
+Status: draft v3.7 for review. Date: 2026-09-28.
 
 Items marked **[pending]** are recommended defaults awaiting the maintainer's confirmation.
 
@@ -35,15 +35,18 @@ deployment is verified, logged, and never reported as successful unless it demon
 - **Public and private repositories.** "No credential" is a valid configuration. Where a credential
   is needed it is always a **personal access token (PAT)**, never a password (4.3).
 - **Development systems.** Promotion to later systems uses the normal transport route.
-- **Older releases stay in scope [pending].** The tool must work on a release with an older abapGit
+- **Older releases stay in scope (decided).** The tool must work on a release with an older abapGit
   as long as the APIs in section 8 exist there.
+- **Git host: GitHub (`github.com`) only in v1 (decided).** Tag listing, the PAT-as-password
+  authentication (4.3) and outward reporting (6.6) are specified and verified only for GitHub.
+  GitHub Enterprise, GitLab, Bitbucket and self-hosted git are out of scope for now.
 
 ### Non-goals (v1)
 
 Automatic rollback, a UI, webhooks or any inbound endpoint, alerting (mail, chat), deployment to
 non-development systems, deserialisation without abapGit, deployment history, the standalone
-single-program abapGit variant, deleting objects that were removed between two tags (a pull does
-not delete them; this is documented).
+single-program abapGit variant, git hosts other than github.com, deleting objects that were removed
+between two tags (a pull does not delete them; this is documented).
 
 ## 2. Behaviour
 
@@ -248,6 +251,7 @@ longest program: `Z_CONTINUOUS_DEPLOYMENT_STATUS`, 30 of 40); the check is repea
   of the current system. Empty = no outward reporting. |
 | `REPORT_CRED_ID` | 40 characters | Reference to a separate PAT allowed to write deployment status (6.6). Empty = no outward reporting. Setting only one of `ENVIRONMENT` / `REPORT_CRED_ID` counts as "reporting off" and produces a note. |
 | `REPORT_ON_PUBLIC` | flag | Allow outward reporting to a **public** repository. Default off (6.6). |
+| `OVERWRITE_POLICY` | 1 character, fixed values | What an unattended pull may overwrite (5.2): `ALWAYS` (default; empty behaves the same), `BLOCK_FOREIGN` or `NEVER`. |
 | `DEPLOY_ON_FIRST_RUN` | flag | See 2.2. Default off. |
 | `MAX_ATTEMPTS` | integer | Attempts per failing tag before the tool stops pulling it (6.1). Default 5; a value of 0 is treated as the default. **[pending]** |
 | `ACTIVE` | flag | Per-repository switch. |
@@ -361,12 +365,27 @@ the leftovers.
 ### 5.2 Unattended pull policy
 
 The pull is `deserialize_checks( )` then `deserialize( checks, log )`. In dialog a person answers
-what `deserialize_checks` reports; in batch nobody can. The policy **[pending]**:
+what `deserialize_checks` reports; in batch nobody can. The policy (the overwrite policy in the first
+bullet is decided; the rest is **[pending]**):
 
-- **Overwrite decisions:** never auto-overwrite an object that has local changes. If
-  `deserialize_checks` reports objects to overwrite, do not pull; fail with `LOCAL_CHANGES` and
-  list the objects. Rationale: this is a development system and other developers' uncommitted
-  work is there.
+- **Overwrite decisions follow `OVERWRITE_POLICY` (4.1), per repository (decided).** On a *target*
+  system git is the source of truth and nobody should be editing that repository's objects there,
+  while SAP itself regenerates artifacts on pull and activation (generated includes, regenerated
+  class sections, DDIC runtime objects) that abapGit reports as "changed locally" although no
+  person touched them. A blanket "never overwrite" would therefore fail almost every second pull.
+  - `ALWAYS` (**default**): every object that `deserialize_checks` lists for overwrite is
+    overwritten. The overwritten objects, each with its last changer as far as abapGit reports
+    one, are **always written to the log** as one information entry per pull that overwrote
+    anything — the audit trail that makes a lost manual edit at least visible afterwards.
+  - `BLOCK_FOREIGN`: an object is overwritten if its last changer is the batch user or no user at
+    all (as abapGit reports for generated objects). If any listed object was last changed by
+    another user, no pull is issued and the attempt fails with `LOCAL_CHANGES`, listing those
+    objects. This depends on abapGit's per-object "changed by" being reliable (spike item 9.6); if
+    it is not, this value is dropped from v1 and nothing else changes.
+  - `NEVER`: any object listed for overwrite means no pull and `LOCAL_CHANGES`. For repositories
+    where people are known to edit on the target.
+  The audit entry is an ordinary information entry when the pull succeeds; it is part of the
+  failure log entry, and follows the alert rule of 6.1a, when it does not.
 - **Any other required decision** (package, requirements, transport, warnings that need an
   answer): do not pull; fail with `NEEDS_DECISION` and name what is missing.
 - **Nothing to deserialise — only on a clean slate.** "Clean slate" means no attempt has happened
@@ -377,12 +396,13 @@ what `deserialize_checks` reports; in batch nobody can. The policy **[pending]**
   **and a newer tag after a failed or crashed one**: the failed attempt's object errors are not
   known any more, so an empty status would make check 3 vacuous and could launder a partly
   deserialised system into `NO_CHANGE`.
-- **The two rules above are subordinate to the decision checks:** if `deserialize_checks` reports
-  `LOCAL_CHANGES` or `NEEDS_DECISION`, no pull is issued even when `force_pull` is set.
+- **The two rules above are subordinate to the decision checks:** if the overwrite policy yields
+  `LOCAL_CHANGES`, or `deserialize_checks` reports `NEEDS_DECISION`, no pull is issued even when
+  `force_pull` is set.
 - Which `deserialize_checks` entries count as "local changes" (a changed object, a type or package
-  mismatch, or every object) is defined by spike item 9.6. Until it is, the predicate is: the
-  object was changed locally since abapGit last deserialised it. If the real list is broader, the
-  policy would block every pull, and the spike must catch that.
+  mismatch, or every object) is defined by spike item 9.6. Under `ALWAYS` the list only feeds the
+  audit entry; under `BLOCK_FOREIGN` and `NEVER` it decides what blocks. If the real list is
+  broader than expected, `NEVER` would block every pull, and the spike must measure it.
 
 ### 5.3 The checks
 
@@ -423,7 +443,7 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 | `REPO_KEY` unknown, repository offline or without URL; stored `D`/`B` no longer parses | `FAILED` (class `CONFIG`); as above. |
 | Config row inactive | Skipped silently. |
 | No tag matches, or none parse | `NOTHING_TO_DO` (quiet); skipped tags appear as a note (2.2). |
-| `LOCAL_CHANGES` or `NEEDS_DECISION` (5.2) | `FAILED` with the failed check; `FAIL_TAG` set; the ref may already be on the tag. |
+| `LOCAL_CHANGES` (only under `OVERWRITE_POLICY` `BLOCK_FOREIGN` or `NEVER`) or `NEEDS_DECISION` (5.2) | `FAILED` with the failed check; `FAIL_TAG` set; the ref may already be on the tag. |
 | Switch succeeds, pull raises | `FAILED` (`DEPLOY_ERROR`); `FAIL_TAG` set; the next run repeats after the back-off (5.1). |
 | Pull "succeeds", verifier fails | `FAILED` with the failed check; as above. |
 | `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | The attempt that made `FAIL_COUNT` reach the cap **always alerts** (log "attempt limit reached", error exit status), whatever the de-duplication says (6.1a). From then on each poll's outcome is `NOTHING_TO_DO` (capped): quiet, heartbeat only. The status report shows the repository red (6.6). It stays so until a different tag becomes the target, or an operator intervenes (6.5). Bounds repeated partial pulls into a shared development system. **[pending]** |
@@ -622,9 +642,8 @@ monitoring. The layers, from most to least accessible:
      makes at most eight calls (visibility, list, at most two supersede calls, create, status)
      and `finished` at most five, so a repository is delayed by at most about 65 seconds, and only
      on a real attempt: quiet polls make no reporter call at all (step 9).
-   - **GitHub (`github.com`) only.** The host is recognised from the repository URL; GitHub
-     Enterprise and other hosts are out of scope for v1 and reporting is off for them.
-     **[pending]**
+   - **GitHub (`github.com`) only (decided).** The host is recognised from the repository URL; a
+     repository on any other host is outside v1, and reporting is off for it.
    - **Separate PAT.** Writing deployments needs more than read access; it uses `REPORT_CRED_ID`
      through `CREDENTIALS->get_report_token`, never through abapGit's login manager, and not the
      read-only pull PAT (4.3).
@@ -738,7 +757,8 @@ The thresholds live in the status report, not in state.
 - **a newer tag after a failed one:** the baseline is kept, `FAIL_TAG`/`FAIL_COUNT` restart, leftovers
   of the earlier tag are still reported by check 4, and the pull is **forced** even when the
   status is empty (`force_pull`), so the result cannot be `NO_CHANGE`
-- `LOCAL_CHANGES` / `NEEDS_DECISION` on a forced pull → no pull issued
+- `LOCAL_CHANGES` (under `BLOCK_FOREIGN` / `NEVER`) / `NEEDS_DECISION` on a forced pull → no pull
+  issued
 - attempt cap: the attempt that makes `FAIL_COUNT` reach `MAX_ATTEMPTS` always alerts (log "attempt
   limit reached", error status); every later poll is `NOTHING_TO_DO` (capped): no deployer call,
   only the poll heartbeat, no log entry, no error status, `ATTEMPT_ERROR` unchanged;
@@ -753,8 +773,13 @@ The thresholds live in the status report, not in state.
 - a stored `D` or `B` that no longer parses → `FAILED` (`CONFIG`)
 - `SKIPPED` and `DRY_RUN` write nothing; `NOTHING_TO_DO` writes only what the first row of 6.2 lists
 - state writes match the table in 6.2 for every outcome
-- unattended policy: overwrite required → `LOCAL_CHANGES`, no pull issued; other decision →
-  `NEEDS_DECISION`
+- overwrite policy: `ALWAYS` overwrites everything listed and writes one log entry naming each
+  overwritten object and its last changer; an empty `OVERWRITE_POLICY` behaves as `ALWAYS`;
+  `BLOCK_FOREIGN` overwrites objects last changed by the batch user or by no user and blocks the
+  pull (`LOCAL_CHANGES`, listing them) if any is foreign; `NEVER` blocks on any overwrite; a
+  regenerated-artifact fixture (listed for overwrite, no foreign changer) passes under `ALWAYS`
+  and `BLOCK_FOREIGN` and blocks under `NEVER`; any other required decision → `NEEDS_DECISION`,
+  no pull issued
 - lock not obtained → `SKIPPED`; `ACTIVE` off → skipped
 - one repository throws → the others still run; exit status is error iff any failed
 - `dry-run` → deployer, reporter and log not called; no state written (not even a baseline or the
@@ -811,6 +836,10 @@ published API, and can change between versions:
 5. Which errors abapGit raises as exceptions and which it puts into the log; check 3 must cover
    both.
 6. What `deserialize_checks` reports for unattended runs, and how to detect "decisions missing".
+   Also measure, on a real pull followed by a second pull of the same tag, **how many objects SAP's
+   own generation makes appear as "changed locally"** (this decides how harmful `NEVER` is), and
+   whether abapGit's per-object "changed by" is present and reliable for the object types in use
+   (this decides whether `BLOCK_FOREIGN` ships).
 7. Whether changing the selected ref to a tag is honoured when the repository object was built
    earlier in the same process.
 8. Release status of the `SECSTORE_*` function modules for customer use.
