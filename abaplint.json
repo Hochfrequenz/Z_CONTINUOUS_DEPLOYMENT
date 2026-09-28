@@ -6,6 +6,13 @@
     "version": "v740sp08",
     "errorNamespace": "^(Z|Y).*$"
   },
+  "dependencies": [
+    {
+      "url": "https://github.com/abaplint/deps",
+      "folder": "/deps",
+      "files": "/src/**/*.*"
+    }
+  ],
   "rules": {
     "parser_error": true,
     "check_syntax": true,
@@ -77,5 +84,12 @@
     "of those names. That is a known false positive; give such a component",
     "another name. It cannot check that a timestamp is really a TIMESTAMPL;",
     "that is a review item. Patterns are case-insensitive."
+  ],
+  "_comment_dependencies": [
+    "abaplint knows no standard SAP class unless it is given stubs: without this, the first exception",
+    "class (INHERITING FROM cx_static_check) fails check_syntax with 'Super class not found'.",
+    "The CLI clones this public repository when it runs, so CI needs outbound network access.",
+    "It is not pinned to a commit (the config takes a URL only); if a bump of the stubs ever changes",
+    "results, that is the place to look."
   ]
 }
