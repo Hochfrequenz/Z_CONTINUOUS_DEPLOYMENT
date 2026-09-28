@@ -1,0 +1,49 @@
+name: abaplint
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Read-only: the job only lints. No token is passed to any step.
+permissions:
+  contents: read
+
+jobs:
+  abaplint:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a commit, not a moving tag. Dependabot keeps the
+      # SHAs current (.github/dependabot.yml) and updates the version comment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      # The abaplint CLI is a devDependency in package.json (exact version) with a
+      # lock file, so Dependabot can bump it and this step proves the bump installs
+      # -- even while src/ is still empty. It is NOT run through
+      # abaplint/actions-abaplint: that action ignores abaplint's exit code and
+      # reports through a separate check run, so the job stayed green whatever
+      # the lint found.
+      - name: Install abaplint
+        run: npm ci --ignore-scripts
+
+      # abaplint exits with an error ("No files found") when src/ holds no ABAP
+      # objects at all, which is this repository's state until the first object
+      # is serialised by SAP. Skip the lint instead of failing every pull request;
+      # the moment src/ contains an object, the lint below runs and enforces. XML
+      # counts too, so a change that only adds DDIC objects (tables, lock
+      # objects) is linted as well.
+      - name: No ABAP sources yet
+        if: ${{ hashFiles('src/**/*.abap', 'src/**/*.xml') == '' }}
+        run: echo "::notice::No ABAP sources under src/ yet; abaplint skipped."
+
+      # Fails the job when abaplint finds issues.
+      - name: abaplint
+        if: ${{ hashFiles('src/**/*.abap', 'src/**/*.xml') != '' }}
+        run: npx --no-install abaplint abaplint.json
