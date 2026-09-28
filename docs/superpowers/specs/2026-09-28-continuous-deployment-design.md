@@ -1,6 +1,6 @@
 # Continuous deployment into SAP development systems via abapGit — design
 
-Status: draft v3.5 for review. Date: 2026-09-28.
+Status: draft v3.6 for review. Date: 2026-09-28.
 
 Items marked **[pending]** are recommended defaults awaiting the maintainer's confirmation.
 
@@ -56,10 +56,16 @@ high frequency is cheap. A poll that finds nothing to do writes no log entry and
 
 1. Acquire the lock. Not obtained → outcome `SKIPPED`, go to step 10 (nothing to write).
 2. Read the state row and resolve the repository by key. If `ATTEMPT_ACTIVE` is still set, the
-   previous attempt did not finish (the lock was free, so nobody is running it): count it as
-   that attempt's failure with `failed_check` = `CRASHED` and `ATTEMPT_ERROR` = `crashed`, clear
-   `ATTEMPT_ACTIVE`, log "previous attempt did not finish" under the alert rule of 6.1a (it may
-   be the attempt that reaches the cap), and carry on.
+   previous attempt did not finish (the lock was free, so nobody is running it). **Crash
+   detection** counts it as that attempt's failure: `failed_check` = `CRASHED`, `ATTEMPT_ERROR` =
+   `crashed`, `ATTEMPT_ERROR_AT` := now, `ATTEMPT_ACTIVE` cleared. It is **committed at once**
+   (`COMMIT WORK`), independently of how the run then ends, and it applies in addition to the
+   outcome rows of 6.2. It is logged, and sets the error exit status, under the alert rule of 6.1a
+   (it may be the attempt that reaches the cap) — even if the run then ends `NOTHING_TO_DO`. After
+   the commit the reporter is told `finished` (`failure`, `CRASHED`) for `FAIL_TAG`, so a GitHub
+   deployment left `in_progress` by the crash is closed (6.6). In `dry-run` the detection is applied
+   in memory only, for the back-off and cap decisions, and the plan prints "would record: previous
+   attempt did not finish".
 3. Ask the credential provider to make the token available (private repositories only).
 4. List the eligible tags (`TAG_SOURCE`) and choose the target (2.1).
 5. Decide (2.2) and check the attempt cap and back-off (6.1). The outcomes `NOTHING_TO_DO`
@@ -217,7 +223,9 @@ that produces `NO_CHANGE`:** it maps "no pull issued + checks 2–4 hold" to `NO
 **Verifier outcome:** `DEPLOYED`, `NO_CHANGE`, `FAILED`. **Run outcome** (what the log and the
 report show): `DEPLOYED`, `NO_CHANGE`, `FAILED`, `SKIPPED`, `BASELINED`, `NOTHING_TO_DO`,
 `DRY_RUN`. **`failed_check`:** `TIMESTAMP`, `REF`, `OBJECT_ERRORS`, `INACTIVE`, `LOCAL_CHANGES`,
-`NEEDS_DECISION`, or initial.
+`NEEDS_DECISION`, `DEPLOY_ERROR` (anything that raises or fails after the attempt marker and is
+not one of the others: the pull raising, locked objects, an unusable transport request, missing
+authorisation, a failing snapshot), `CRASHED`, or initial.
 
 ### 3.2 Naming
 
@@ -416,13 +424,13 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 | Config row inactive | Skipped silently. |
 | No tag matches, or none parse | `NOTHING_TO_DO` (quiet); skipped tags appear as a note (2.2). |
 | `LOCAL_CHANGES` or `NEEDS_DECISION` (5.2) | `FAILED` with the failed check; `FAIL_TAG` set; the ref may already be on the tag. |
-| Switch succeeds, pull raises | `FAILED`; `FAIL_TAG` set; the next run repeats (5.1). |
+| Switch succeeds, pull raises | `FAILED` (`DEPLOY_ERROR`); `FAIL_TAG` set; the next run repeats after the back-off (5.1). |
 | Pull "succeeds", verifier fails | `FAILED` with the failed check; as above. |
 | `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | The attempt that made `FAIL_COUNT` reach the cap **always alerts** (log "attempt limit reached", error exit status), whatever the de-duplication says (6.1a). From then on each poll's outcome is `NOTHING_TO_DO` (capped): quiet, heartbeat only. The status report shows the repository red (6.6). It stays so until a different tag becomes the target, or an operator intervenes (6.5). Bounds repeated partial pulls into a shared development system. **[pending]** |
 | `FAIL_COUNT` below the cap, but the back-off has not elapsed | `NOTHING_TO_DO` (quiet), "waiting for back-off" (6.1a). |
 | Lock not obtained | `SKIPPED`; nothing written. |
-| Locked objects, unusable transport request, missing authorisation | `FAILED`; cause logged; `FAIL_TAG` set. |
-| Job cancelled, killed, or dumped mid-pull | The attempt marker (5.1) is already committed. The next run finds `ATTEMPT_ACTIVE` still set (step 2), logs "previous attempt did not finish" as that attempt's failure, and then retries after the back-off, against the original baseline. The enqueue lock is released when the session ends. A dump inside abapGit ends the whole job, so repositories after it are handled next run. |
+| Locked objects, unusable transport request, missing authorisation | `FAILED` (`DEPLOY_ERROR`); cause logged; `FAIL_TAG` set. |
+| Job cancelled, killed, or dumped mid-pull | The attempt marker (5.1) is already committed. The next run finds `ATTEMPT_ACTIVE` still set (step 2), logs "previous attempt did not finish" as that attempt's failure (under the alert rule of 6.1a), and then retries after the back-off, against the original baseline. The enqueue lock is released when the session ends. A dump inside abapGit ends the whole job, so repositories after it are handled next run. |
 
 ### 6.1a Back-off and alert de-duplication
 
@@ -432,21 +440,26 @@ rules.
 
 **Back-off between attempts** of the same tag. After attempt *n* has failed or crashed, the next
 attempt is not made before `ATTEMPT_ERROR_AT` (which a crash detection sets, step 2) plus a wait of
-1, 2, 5, 10 minutes for *n* = 1, 2, 3, 4 and 10 minutes for any later *n*; for *n* = 0 (a fresh tag,
-or after `RESET_ATTEMPTS`) there is no wait. **[pending]** With the default `MAX_ATTEMPTS` of 5, a
+1, 2, 5, 10 minutes for *n* = 1, 2, 3, 4 and 10 minutes for any later *n*, where *n* is
+`FAIL_COUNT` if `FAIL_TAG` equals the target tag and 0 otherwise; for *n* = 0 (a fresh tag, or after
+`RESET_ATTEMPTS`) there is no wait. **[pending]** With the default `MAX_ATTEMPTS` of 5, a
 transient cause has about 18 minutes to clear before an operator is needed. A run inside the wait
 is `NOTHING_TO_DO` (quiet).
 
 **Alerting for attempt failures is deterministic and uses no clock.** An attempt failure is logged
-and sets the error exit status (6.4) if **any** of these holds, evaluated on the row as read in
-step 2:
+and sets the error exit status (6.4) if **any** of these holds. The inputs are defined exactly:
+*n* is `FAIL_COUNT` **as written by this attempt's marker** (step 6) — or, for a crash detected in
+step 2, the value in the row as read, because the marker already counted that attempt — and
+*previous check* is `ATTEMPT_CHECK` **as read in step 2, before this failure overwrites it**. The
+effective `MAX_ATTEMPTS` is used (0 means 5).
 
-- it is the first failed attempt of this tag (`FAIL_COUNT` = 1, which restarts for every new tag,
-  so a new tag's first failure is never swallowed by the previous tag's alert);
-- it is the attempt that makes `FAIL_COUNT` reach `MAX_ATTEMPTS` (the cap is always announced);
-- its `failed_check` differs from `ATTEMPT_CHECK`.
+- *n* = 1: the first failed attempt of this tag (the count restarts for every new tag, so a new
+  tag's first failure is never swallowed by the previous tag's alert, even right after a capped
+  tag);
+- *n* = effective `MAX_ATTEMPTS`: the attempt that reaches the cap (the cap is always announced);
+- its `failed_check` differs from the *previous check*.
 
-Otherwise (attempts 2 to 4 failing the same way) only state is written.
+Otherwise (attempts 2 to `MAX_ATTEMPTS` − 1 failing the same way) only state is written.
 
 **Alerting for poll errors** uses the class and a clock. A poll error is logged and sets the error
 exit status if its class differs from `POLL_ERROR_CLASS` as read in step 2, or at least 60 minutes
@@ -460,6 +473,8 @@ back-off, the status report and the heartbeat stay accurate.
 an error of that class** (a stored `D` or `B` that does not parse is a `CONFIG` error found after a
 successful listing, and must not flip between cleared and raised every minute). `ATTEMPT_*` is
 cleared only by a verified deployment (6.2) and is never touched by poll errors or their recovery.
+`POLL_ALERT_AT` is deliberately kept when the error is cleared, and clearing a poll error writes
+one information entry to the log ("tag listing recovered") so that an outage visibly ends.
 
 ### 6.2 What each outcome writes to the state row
 
@@ -472,10 +487,16 @@ cleared only by a verified deployment (6.2) and is never touched by poll errors 
 | `NOTHING_TO_DO` (including waiting for back-off, and a capped tag on later polls) | nothing beyond the first row of this table, plus the row-3 prefix if it applies | everything else |
 | `SKIPPED` (lock busy) | **nothing** | everything |
 | `DRY_RUN` | **nothing** (no state, no heartbeat, no log entry) | everything |
-| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_TAKEN`, `SNAP_INACTIVE` if not yet taken, `ATTEMPT_ACTIVE` := X, `ATTEMPT_AT` := now | `DEPLOYED_*`, `BASELINE_*`, `ATTEMPT_ERROR*` |
+| **crash detected (step 2)** — applies *in addition to* whichever row follows | `ATTEMPT_ACTIVE` cleared, `ATTEMPT_ERROR` := `crashed`, `ATTEMPT_CHECK` := `CRASHED`, `ATTEMPT_ERROR_AT` := now, `LAST_OUTCOME` := `FAILED`; committed at once | everything else |
+| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_TAKEN`, `SNAP_INACTIVE` if not yet taken, `ATTEMPT_ACTIVE` := X, `ATTEMPT_AT` := now; **when `FAIL_TAG` changes, `ATTEMPT_ERROR`, `ATTEMPT_CHECK` and `ATTEMPT_ERROR_AT` are cleared** (the new tag has not failed yet, and the status report must not show the old tag's error as the new tag's) | `DEPLOYED_*`, `BASELINE_*` |
 | `DEPLOYED`, `NO_CHANGE` | `DEPLOYED_TAG/COMMIT/AT`, `LAST_OUTCOME`; clear `FAIL_*`, `SNAP_*`, `ATTEMPT_*` | `BASELINE_*`, `POLL_ERROR*` |
 | `FAILED` after an attempt started (or a crash detected in step 2) | clear `ATTEMPT_ACTIVE`; `ATTEMPT_ERROR`, `ATTEMPT_CHECK`, `ATTEMPT_ERROR_AT`, `LAST_OUTCOME`; the log entry and exit status follow the alert rule of 6.1a | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `SNAP_*`, `POLL_ERROR*` |
 | `FAILED` on a poll (`REMOTE`, `AUTH`, `CONFIG`) | `POLL_ERROR_CLASS`, `POLL_ERROR`, `POLL_ERROR_AT` (only if a new streak), `POLL_ALERT_AT` if it alerts, `LAST_OUTCOME` | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `ATTEMPT_*`, `SNAP_*` |
+
+The outcome rows' "not touched" columns never undo the crash-detection row: that write is committed
+in step 2, before any of them applies. The first write for a repository that has no state row is an
+insert. `LAST_OUTCOME` is written only by outcomes that are not a quiet poll, so a crash detection
+followed by `NOTHING_TO_DO` (back-off, or capped) leaves `FAILED` in place.
 
 **Heartbeat.** `LAST_POLL_AT` is written on every path through step 9, `LAST_POLL_OK_AT` only when
 tag listing succeeded. A quiet poll is one single-row update carrying the heartbeat, `LATEST_TAG`
@@ -513,7 +534,7 @@ next tag, or re-running once the cause is fixed.
 ### 6.4 Reporting and exit status
 
 One application-log entry per repository per run **for every outcome except `NOTHING_TO_DO` and
-`SKIPPED`**: run outcome, tag, failed check if any. Repeated identical failures are logged only as
+`SKIPPED`** (a crash detected in step 2 is logged whatever the run then ends as): run outcome, tag, failed check if any. Repeated identical failures are logged only as
 6.1a allows, and notes only when they change (2.2). A minute-by-minute job that logged "nothing to
 do" would bury the entries that matter. The spool likewise lists only what was logged, and is empty
 for a quiet poll. State and
@@ -521,9 +542,10 @@ log are written and committed **per repository** (step 9). At the end the report
 to the spool and then decides the exit status; nothing that matters is left uncommitted when the
 final message aborts the job.
 
-The report ends with message type `E` if **any** repository ended `FAILED` *and that failure
-alerts under 6.1a* (a new failure, or a reminder after an hour), so the job appears as cancelled in
-the job overview once per problem and not once per minute. Runs with only `DEPLOYED`, `NO_CHANGE`, `NOTHING_TO_DO`,
+The report ends with message type `E` if **any failure alerts under 6.1a** — a repository that ended
+`FAILED`, or a crash detected in step 2 whatever the run then ended as (a new failure, the attempt
+that reaches the cap, or a reminder after an hour) — so the job appears as cancelled in the job
+overview once per problem and not once per minute. Runs with only `DEPLOYED`, `NO_CHANGE`, `NOTHING_TO_DO`,
 `BASELINED`, `SKIPPED` end normally. `dry-run` prints its plan to the spool and **writes nothing else**: no state, no heartbeat, no
 application-log entry, no reporter call. It does contact the remote and read credentials. If a dry
 run meets a failure that a real run would hit (remote unreachable, bad credential, attempt limit
@@ -537,7 +559,8 @@ Automatic recovery stops at the attempt cap by design. To resume a repository, a
 1. Reads `ATTEMPT_ERROR` and the application log for the cause, and fixes it (for example activates
    or removes objects the failed attempt left inactive, or resolves the local changes).
 2. **Resets the attempt count** (`FAIL_COUNT` := 0) with the setup report's `RESET_ATTEMPTS`
-   function. `FAIL_TAG` and the stored inactive baseline are kept, so the next attempt is still
+   function. `FAIL_TAG`, `ATTEMPT_*` and the stored inactive baseline are kept (so the status report
+   stays red until the next attempt actually succeeds, which is truthful), so the next attempt is still
    judged against the original baseline and cannot record a false success.
 3. If check 4 keeps failing only because *other developers* have made objects in the package
    inactive since the baseline was taken, and the operator has verified by hand that nothing left
@@ -672,7 +695,9 @@ The thresholds live in the status report, not in state.
   `ATTEMPT_ERROR_AT`; *n* = 0 waits not at all; a run inside the wait is `NOTHING_TO_DO`; a crash
   is detected in step 2, sets `ATTEMPT_ERROR_AT`, and waits the same way
 - attempt alerts: the first failure of a tag alerts, also within an hour of the previous tag's
-  alert; attempts 2 to 4 failing with the same `failed_check` do not; the attempt that reaches the
+  alert; attempts 2 to `MAX_ATTEMPTS` − 1 failing with the same `failed_check` do not; *n* is the count
+  written by this attempt's marker, not the count read in step 2 (a new tag right after a capped one
+  alerts on its first failure even if it fails the same way); the attempt that reaches the
   cap always alerts; a different `failed_check` alerts; state is written in every case
 - poll-error alerts: an identical repeated failure neither logs nor sets the error status for 60
   minutes; a different class does at once; a reminder follows after 60 minutes; a successful poll
@@ -682,7 +707,16 @@ The thresholds live in the status report, not in state.
   intact, and its recovery does not clear them
 - crash detection: `ATTEMPT_ACTIVE` still set when a run gets the lock is logged as "previous
   attempt did not finish", counts as a failed attempt (including the one that reaches the cap),
-  and the retry waits from the detection
+  and the retry waits from the detection; the crash fields are committed in step 2 even when the
+  run then ends `NOTHING_TO_DO`, so the next minute does not detect the same crash again; the
+  crash that reaches the cap sets the error exit status although the run ends `NOTHING_TO_DO`;
+  the reporter is told `finished` (`CRASHED`) so no deployment stays `in_progress`; in `dry-run`
+  nothing is written
+- when `FAIL_TAG` changes, the previous tag's `ATTEMPT_ERROR*` is cleared by the marker and the
+  status report does not show the new tag as failing; `RESET_ATTEMPTS` keeps `ATTEMPT_*`
+- a repository without a state row: the first write is an insert; a failed first listing leaves
+  `BASELINED` empty, so the first-run rule still applies on the next successful poll
+- recovery of a poll error writes exactly one "tag listing recovered" log entry
 - notes are logged only when their hash changes
 - the status report (state and config table only, no remote call): red beats yellow beats green;
   a crashed attempt older than the threshold is red; a stale heartbeat is red **except** while an
