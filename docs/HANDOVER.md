@@ -60,13 +60,17 @@ defects on the first run; the red/green steps exist for that.
   name of a private repository in commits, PRs or documents. Say "the older system" and "the newer system".
 - abapGit XML is never hand-written: create on a system through ADT, export, commit what SAP serialised.
 
+**Do not:** implement or detail plans 03 and 04 until `docs/spike/RESULTS.md` records the two gates G1 and G2
+(plan 00, sections 1 and 2). Do not run anything on an SAP system - probe classes and unit tests included -
+without asking the maintainer first.
+
 ## 5. Tooling facts worth knowing
 
 - The ADT loop is in plan 00, section 3. `mcp__sap-adt__export_package` needs the companion export package on
   the system.
-- **abaplint** runs only the rules listed in `abaplint.json`, needs `dependencies` to know any standard class,
-  and its `object_naming` patterns lose a backslash (use character classes). Details are comments in
-  `abaplint.json`.
+- **abaplint** (`abaplint.json` exists only once the abaplint CI pull request, #3, is merged) runs only the rules
+  listed in it, needs `dependencies` to know any standard class, and its `object_naming` patterns lose a
+  backslash (use character classes). Details are comments in that file.
 - **Short snippets on a real system are cheap and worth it** (plan 00, section 4a): one throwaway class in the
   local package implementing `IF_OO_ADT_CLASSRUN`, run with `mcp__sap-adt__run_class`, then deleted and
   confirmed gone. It found two real defects that lint could not. A classrun class cannot be a job step.
