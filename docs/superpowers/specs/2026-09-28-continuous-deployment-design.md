@@ -1,6 +1,6 @@
 # Continuous deployment into SAP development systems via abapGit — design
 
-Status: draft v3 for review. Date: 2026-09-28.
+Status: draft v3.2 for review. Date: 2026-09-28.
 
 Items marked **[pending]** are recommended defaults awaiting the maintainer's confirmation.
 
@@ -38,26 +38,31 @@ not delete them; this is documented).
 A batch job runs the report periodically (suggested: every 15 minutes). For each active configured
 repository, **inside one lock** (section 6.3):
 
-1. Acquire the lock. Not obtained → outcome `SKIPPED`, continue with the next repository.
+1. Acquire the lock. Not obtained → outcome `SKIPPED`, go to step 10 (nothing to write).
 2. Read the state row and resolve the repository by key.
 3. Ask the credential provider to make the token available (private repositories only).
 4. List the eligible tags (`TAG_SOURCE`) and choose the target (2.1).
-5. Decide (2.2). `NOTHING_TO_DO`, `BASELINED` and `SKIPPED` end here. In `dry-run` mode the run
-   logs what *would* happen (`DRY_RUN`, including "would baseline") and stops here, **before
-   writing any state**.
-6. If `FAIL_TAG` equals the target and `FAIL_COUNT` has reached `MAX_ATTEMPTS`, end with
-   `FAILED` without pulling (6.1). Otherwise take the snapshot and **write the attempt marker**
-   (5.1), then `COMMIT WORK`. The lock survives the commit (6.3).
-7. Switch the repository to the tag and deploy (`DEPLOYER`, 5.2).
+5. Decide (2.2) and check the attempt cap (6.1). The outcomes `NOTHING_TO_DO`, `BASELINED` and
+   `FAILED` (cap reached) are terminal: **go to step 9**. In `dry-run` mode the run logs what
+   *would* happen (`DRY_RUN`, including "would baseline" and "would stop: attempt limit
+   reached") and goes to step 10, **before writing any state**.
+6. Take the snapshot if none is held and **write the attempt marker** (5.1), then `COMMIT WORK`.
+   The lock survives the commit (6.3).
+7. Switch the repository to the tag — **always**, even if no pull is issued, because check 2 needs
+   it — and deploy (`DEPLOYER`, 5.2).
 8. Verify (`VERIFIER`, section 5).
-9. Write the outcome state (6.2) and the log, then `COMMIT WORK` — **per repository**, so a dump
-   in a later repository cannot lose the recorded outcome of an earlier one.
+9. Write the outcome state (6.2) and the log, then `COMMIT WORK`. **Every** path that ends a
+   repository, terminal or not, passes through this step, so a dump in a later repository cannot
+   lose the recorded outcome of an earlier one.
 10. Release the lock. The release also runs in a cleanup handler; the enqueue is released by the
     system when the session ends.
 
 A failure in one repository never stops the others, with one exception: a short dump inside
 abapGit cannot be caught and ends the whole job. The attempt marker (step 6) is what makes the next
-run safe after such a crash. At the end the report sets its exit status (6.4).
+run safe after such a crash. A repository that dumps on every attempt therefore delays the
+repositories after it until the attempt cap (6.1) takes effect; repositories whose state has
+`FAIL_TAG` set are processed **last** in each run to limit this. At the end the report sets its exit
+status (6.4).
 
 The trigger is a **git tag**. Branch HEAD is deliberately not the trigger: a tag is a deliberate
 promotion step and a clean rollback target.
@@ -96,14 +101,16 @@ Let `D` = `DEPLOYED_TAG` and `B` = `BASELINE_TAG` from the state row, `T` = the 
 | 9 | `D` empty, `B` set, `T` newer than `B` | Deploy. |
 | 10 | `D` empty, `B` set, `T` equal to or older than `B` | `NOTHING_TO_DO`. This is the steady state of every baselined repository until its next release. |
 
-Rows 2 and 3 write the baseline fields in the same commit as the outcome of whichever row follows
-them. Rationale for baselining: the repository may already have been pulled manually from a
-branch, and silently moving it to a tag is surprising. A consequence: the first release *after*
-the baseline is the first thing deployed. This is intended.
+Rows 2 and 3 write the baseline fields together with the fields of whichever outcome follows
+them, committed no later than the attempt marker (step 6) or step 9, whichever comes first.
 
 Rationale for baselining: the repository may already have been pulled manually from a branch, and
 silently moving it to a tag is surprising. A consequence: the first release *after* the baseline is
 the first thing deployed. This is intended.
+
+**Withdrawn tag after a failed attempt.** If `FAIL_TAG` is set and differs from the tag the rows
+above would act on (for example the failing tag was deleted, so `T` equals `D`), the run logs a
+warning "the system may be partly at `FAIL_TAG`". The row's normal outcome still applies.
 
 ## 3. Components
 
@@ -121,7 +128,7 @@ fakes.
 | `ZIF_CDEPLOY_LOG` | Write to the application log and return a summary | application log |
 | `ZCL_CDEPLOY_RUN` | Orchestrate section 2 | all interfaces above |
 | `Z_CONTINUOUS_DEPLOYMENT` (report) | Batch entry point; parameter `dry-run` | `ZCL_CDEPLOY_RUN` |
-| `Z_CONTINUOUS_DEPLOYMENT_SETUP` (report) | Store/rotate/delete a credential | credentials class |
+| `Z_CONTINUOUS_DEPLOYMENT_SETUP` (report) | Store/rotate/delete a credential; operator functions `RESET_ATTEMPTS` and `CLEAR_BASELINE` (6.5) | credentials class, state |
 
 Production implementations: `ZCL_CDEPLOY_CONFIG_DB`, `ZCL_CDEPLOY_CREDENTIALS_SECSTORE`,
 `ZCL_CDEPLOY_TAGS_ABAPGIT`, `ZCL_CDEPLOY_STATE_DB`, `ZCL_CDEPLOY_DEPLOYER_ABAPGIT`,
@@ -137,11 +144,15 @@ failure class from 6.1 and a message).
 | `TAG_SOURCE->get_tags` | repo key, tag pattern | `{eligible[{name,version,commit}], skipped[{name,reason}]}` / `ZCX_CDEPLOY_ERROR` |
 | `STATE->get`, `->save` | repo key / state row | state row |
 | `VERIFIER->snapshot` | repo key | `{deserialized_at, inactive_objects}` |
-| `DEPLOYER->deploy` | repo key, tag, commit | `{pull_status, object_errors, decisions_missing}` / `ZCX_CDEPLOY_ERROR` |
+| `DEPLOYER->deploy` | repo key, tag, commit, **`force_pull`** | `{pull_issued, pull_status, object_errors, decisions_missing}` / `ZCX_CDEPLOY_ERROR` |
 | `VERIFIER->verify` | repo key, target tag+commit, snapshot, **deploy result** | `{ok, outcome, failed_check, objects}` |
 | `LOG->add`, `->summary` | repo key, run outcome, text | – / printable text |
 
-The verifier receives the deploy result because checks 3 (object errors) needs it.
+The verifier receives the deploy result because check 3 (object errors) needs it. The orchestrator
+sets `force_pull` whenever an attempt has already happened since the last verified deployment (5.2).
+The deployer always switches the ref; it issues a pull unless the status is empty **and**
+`force_pull` is not set, and reports which it did in `pull_issued`. **The verifier is the only unit
+that produces `NO_CHANGE`:** it maps "no pull issued + checks 2–4 hold" to `NO_CHANGE`.
 
 **Verifier outcome:** `DEPLOYED`, `NO_CHANGE`, `FAILED`. **Run outcome** (what the log and the
 report show): `DEPLOYED`, `NO_CHANGE`, `FAILED`, `SKIPPED`, `BASELINED`, `NOTHING_TO_DO`,
@@ -164,7 +175,7 @@ inside DDIC limits (tables 16, classes and interfaces 30, lock objects 16 charac
 | `TAG_PATTERN` | string | See 2.1. |
 | `CRED_ID` | 40 characters | Reference to a stored credential. Empty = public repository. |
 | `DEPLOY_ON_FIRST_RUN` | flag | See 2.2. Default off. |
-| `MAX_ATTEMPTS` | integer | Attempts per failing tag before the tool stops pulling it (6.1). Default 3. **[pending]** |
+| `MAX_ATTEMPTS` | integer | Attempts per failing tag before the tool stops pulling it (6.1). Default 3; a value of 0 is treated as the default. **[pending]** |
 | `ACTIVE` | flag | Per-repository switch. |
 | `DESCRIPTION` | 80 characters | Free text. |
 
@@ -192,7 +203,8 @@ inside DDIC limits (tables 16, classes and interfaces 30, lock objects 16 charac
 | `FAIL_COUNT` | Attempts made for `FAIL_TAG`. |
 | `LAST_ERROR` | Last failure text, or `attempt in progress` while a pull runs. Never contains a credential. |
 | `LAST_ERROR_AT` | Timestamp of it. |
-| `SNAP_INACTIVE` | Inactive objects at the start of the **first** attempt since the last verified deployment (string, one `TYPE NAME` per line; all users; restricted to the repository's package and its sub-packages). |
+| `SNAP_TAKEN` | Flag: the inactive-object baseline has been taken for the current run of attempts. Set with the attempt marker; cleared only on `DEPLOYED` / `NO_CHANGE`. It, **not** the emptiness of `SNAP_INACTIVE`, decides whether a baseline exists — a clean package legitimately has zero inactive objects. |
+| `SNAP_INACTIVE` | Inactive objects at the start of the **first** attempt since the last verified deployment (string, one `TYPE NAME` per line; all users; restricted to the repository's package and its sub-packages). May be empty when `SNAP_TAKEN` is set. |
 
 State holds the current picture only, not a history. There is deliberately no stored timestamp
 snapshot: the timestamp for check 1 is always read fresh (5.1).
@@ -229,14 +241,15 @@ the repository's transport request.
   attempt already moved.
 - **The inactive-object baseline** must not absorb leftovers of failed attempts, so it is kept
   across attempts:
-  - If `SNAP_INACTIVE` is empty (no attempt since the last verified deployment), take it now and
-    store it.
-  - If `SNAP_INACTIVE` is already set, **keep it** — also when a *different, newer tag* is
-    attempted (a new tag does not launder the leftovers of the previous one).
-  - Clear it only on `DEPLOYED` or `NO_CHANGE`.
+  - If `SNAP_TAKEN` is not set (no attempt since the last verified deployment), take the baseline
+    now and store it together with `SNAP_TAKEN`.
+  - If `SNAP_TAKEN` is set, **keep the stored baseline**, whatever it contains — also when a
+    *different, newer tag* is attempted (a new tag does not launder the leftovers of the previous
+    one).
+  - Clear both only on `DEPLOYED` or `NO_CHANGE`.
 
 **The attempt marker.** In step 6, before the pull, the run writes `FAIL_TAG := target`,
-`FAIL_COUNT` +1 (1 for a new tag), `SNAP_INACTIVE` (if empty) and
+`FAIL_COUNT` +1 (1 for a new tag), `SNAP_TAKEN` and `SNAP_INACTIVE` (if not yet taken) and
 `LAST_ERROR := 'attempt in progress'`, then commits. On success these are cleared. If the process
 dies mid-pull (short dump, cancelled job, killed work process), the marker is already committed:
 the next run sees `FAIL_TAG` = target, treats it as a retry, and still has the original inactive
@@ -254,12 +267,16 @@ what `deserialize_checks` reports; in batch nobody can. The policy **[pending]**
   work is there.
 - **Any other required decision** (package, requirements, transport, warnings that need an
   answer): do not pull; fail with `NEEDS_DECISION` and name what is missing.
-- **Nothing to deserialise (fresh attempts only):** if abapGit's repository status shows no
-  difference between the remote files at the target tag and the local objects, no pull is issued and
-  the result is `NO_CHANGE` (subject to checks 2–4).
-- **A retry (`FAIL_TAG` equals the target) always issues the pull.** There is no empty-status
-  shortcut, because the failed attempt's object errors are not known any more and an empty status
-  would make check 3 vacuous.
+- **Nothing to deserialise — only on a clean slate.** "Clean slate" means no attempt has happened
+  since the last verified deployment: `FAIL_TAG` is empty **and** `SNAP_TAKEN` is not set. Then, if
+  abapGit's repository status shows no difference between the remote files at the target tag and
+  the local objects, no pull is issued and the result is `NO_CHANGE` (subject to checks 2–4).
+- **Otherwise the pull is always issued (`force_pull`).** This covers a retry of the same tag
+  **and a newer tag after a failed or crashed one**: the failed attempt's object errors are not
+  known any more, so an empty status would make check 3 vacuous and could launder a partly
+  deserialised system into `NO_CHANGE`.
+- **The two rules above are subordinate to the decision checks:** if `deserialize_checks` reports
+  `LOCAL_CHANGES` or `NEEDS_DECISION`, no pull is issued even when `force_pull` is set.
 - Which `deserialize_checks` entries count as "local changes" (a changed object, a type or package
   mismatch, or every object) is defined by spike item 9.6. Until it is, the predicate is: the
   object was changed locally since abapGit last deserialised it. If the real list is broader, the
@@ -284,8 +301,9 @@ checks that apply hold. `NO_CHANGE` still requires checks 2, 3 and 4.
    snapshot. Objects inactive before the snapshot (other developers' work) are ignored. Otherwise
    `FAILED` (`INACTIVE`).
 
-`NO_CHANGE` is only possible on a fresh attempt (5.2): a retry always pulls, so its outcome is
-`DEPLOYED` or `FAILED`, never `NO_CHANGE`.
+`NO_CHANGE` is only possible on a clean slate (5.2): once any attempt has happened since the last
+verified deployment, every pull is forced, so the outcome is `DEPLOYED` or `FAILED`, never
+`NO_CHANGE`.
 
 ### Side effect on the repository's selected ref
 
@@ -306,7 +324,7 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 | `LOCAL_CHANGES` or `NEEDS_DECISION` (5.2) | `FAILED` with the failed check; `FAIL_TAG` set; the ref may already be on the tag. |
 | Switch succeeds, pull raises | `FAILED`; `FAIL_TAG` set; the next run repeats (5.1). |
 | Pull "succeeds", verifier fails | `FAILED` with the failed check; as above. |
-| `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | `FAILED` **without pulling**, message "attempt limit reached". Stays so until a different tag becomes the target, or an administrator clears `FAIL_TAG` in the state row. Bounds repeated partial pulls into a shared development system. **[pending]** |
+| `FAIL_COUNT` reached `MAX_ATTEMPTS` for the target tag | `FAILED` **without pulling**. "Attempt limit reached" goes to the log only; **the state row is not written**, so `LAST_ERROR` keeps the real error. Stays so until a different tag becomes the target, or an operator intervenes (6.5). Bounds repeated partial pulls into a shared development system. **[pending]** |
 | Lock not obtained | `SKIPPED`; nothing written. |
 | Locked objects, unusable transport request, missing authorisation | `FAILED`; cause logged; `FAIL_TAG` set. |
 | Job cancelled, killed, or dumped mid-pull | The attempt marker (5.1) is already committed, so the next run retries against the original baseline. The enqueue lock is released when the session ends. A dump inside abapGit ends the whole job, so repositories after it are handled next run. |
@@ -315,11 +333,13 @@ pulls the tag, not the branch. This is intended and documented; the tool never r
 
 | Outcome | Written | Not touched |
 |---|---|---|
+| row-3 prefix (2.2: `DEPLOY_ON_FIRST_RUN`) | `BASELINED` := X, `BASELINE_TAG` := empty — **written together with the fields of the outcome that follows** (attempt marker or `NOTHING_TO_DO`) | – |
 | `BASELINED` | `BASELINED`, `BASELINE_TAG` | everything else |
-| `NOTHING_TO_DO`, `SKIPPED`, `DRY_RUN` | nothing | everything |
-| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_INACTIVE` if empty, `LAST_ERROR := attempt in progress` | `DEPLOYED_*`, `BASELINE_*` |
-| `DEPLOYED`, `NO_CHANGE` | `DEPLOYED_TAG/COMMIT/AT`; clear `FAIL_*`, `SNAP_INACTIVE`, `LAST_ERROR*` | `BASELINE_*` |
-| `FAILED` after an attempt started | `LAST_ERROR*` := the actual error | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `SNAP_INACTIVE` |
+| `NOTHING_TO_DO`, `SKIPPED`, `DRY_RUN` | nothing (except the row-3 prefix, if it applies) | everything |
+| attempt limit reached | nothing (log only, 6.1) | everything |
+| attempt starts (step 6) | `FAIL_TAG`, `FAIL_COUNT`+1 (1 for a new tag), `SNAP_TAKEN`, `SNAP_INACTIVE` if not yet taken, `LAST_ERROR := attempt in progress` | `DEPLOYED_*`, `BASELINE_*` |
+| `DEPLOYED`, `NO_CHANGE` | `DEPLOYED_TAG/COMMIT/AT`; clear `FAIL_*`, `SNAP_*`, `LAST_ERROR*` | `BASELINE_*` |
+| `FAILED` after an attempt started | `LAST_ERROR*` := the actual error | `DEPLOYED_*`, `BASELINE_*`, `FAIL_*`, `SNAP_*` |
 | `FAILED` without a target tag or before the marker was written | `LAST_ERROR*` only | everything else |
 
 "Deployed fields unchanged" is what "state unchanged" means throughout: a failed attempt never
@@ -350,7 +370,28 @@ final message aborts the job.
 The report ends with message type `E` if **any** repository ended `FAILED`, so the job appears as
 cancelled in the job overview. Runs with only `DEPLOYED`, `NO_CHANGE`, `NOTHING_TO_DO`,
 `BASELINED`, `SKIPPED` end normally. `dry-run` never sets the error status and never calls the
-deployer, but does contact the remote, read credentials and write log entries marked `DRY-RUN`.
+deployer, but does contact the remote, read credentials and write log entries marked `DRY-RUN`. If
+a dry run meets a failure that a real run would hit (remote unreachable, bad credential, attempt
+limit reached), it logs "would fail: …" and, by the rule above, still ends normally: **for
+`dry-run`, "never sets the error status" wins over "E if any repository failed".**
+
+### 6.5 Operator recovery
+
+Automatic recovery stops at the attempt cap by design. To resume a repository, an operator:
+
+1. Reads `LAST_ERROR` and the application log for the cause, and fixes it (for example activates
+   or removes objects the failed attempt left inactive, or resolves the local changes).
+2. **Resets the attempt count** (`FAIL_COUNT` := 0) with the setup report's `RESET_ATTEMPTS`
+   function. `FAIL_TAG` and the stored inactive baseline are kept, so the next attempt is still
+   judged against the original baseline and cannot record a false success.
+3. If check 4 keeps failing only because *other developers* have made objects in the package
+   inactive since the baseline was taken, and the operator has verified by hand that nothing left
+   inactive by the failed attempt remains, the setup report's `CLEAR_BASELINE` function clears
+   `FAIL_TAG`, `SNAP_TAKEN` and `SNAP_INACTIVE`. **This deliberately re-opens the false-success
+   risk for the next attempt** and is why it is a separate, explicit action.
+
+A complete but unrecorded deserialisation (a crash after the last object, before the outcome was
+written) is recovered the same way; whether the retry can pass by itself depends on spike item 9.4.
 
 ## 7. Testing
 
@@ -363,15 +404,26 @@ deployer, but does contact the remote, read credentials and write log entries ma
 - tag grammar: matching but unparseable tag skipped; pre-release skipped; `v1.10.0` beats
   `v1.9.0`; equal versions tie-break; case-insensitive pattern
 - each verifier check fails on its own and yields the right `failed_check`
-- `NO_CHANGE` requires checks 2–4 and is impossible on a retry
+- `NO_CHANGE` requires checks 2–4, is only possible on a clean slate, and only the verifier
+  produces it
 - **retry after partial failure:** first attempt fails, second attempt cannot pass on leftovers
   (check 4 uses the stored baseline) and cannot pass on a timestamp the first attempt already
   moved (check 1 reads it fresh)
+- **zero-inactive baseline:** the package has *no* inactive objects at the first attempt, the
+  attempt leaves some, the retry must be `FAILED` (`INACTIVE`) — `SNAP_TAKEN`, not emptiness of
+  `SNAP_INACTIVE`, decides that a baseline exists
 - **crash path:** a fake that dies after the attempt marker is committed leaves `FAIL_TAG` set, so
   the next run is a retry with the original `SNAP_INACTIVE`, never a fresh attempt
-- **a newer tag after a failed one:** `SNAP_INACTIVE` is kept, `FAIL_TAG`/`FAIL_COUNT` restart, and
-  leftovers of the earlier tag are still reported by check 4
-- attempt cap: `FAIL_COUNT` = `MAX_ATTEMPTS` → `FAILED` with no deployer call
+- **a newer tag after a failed one:** the baseline is kept, `FAIL_TAG`/`FAIL_COUNT` restart, leftovers
+  of the earlier tag are still reported by check 4, and the pull is **forced** even when the
+  status is empty (`force_pull`), so the result cannot be `NO_CHANGE`
+- `LOCAL_CHANGES` / `NEEDS_DECISION` on a forced pull → no pull issued
+- attempt cap: `FAIL_COUNT` = `MAX_ATTEMPTS` → `FAILED` with no deployer call and **no state
+  write** (`LAST_ERROR` unchanged); `MAX_ATTEMPTS` 0 behaves as 3
+- terminal outcomes (`BASELINED`, `NOTHING_TO_DO`, cap) pass through step 9 and are committed
+  before the next repository is processed
+- a repository with `FAIL_TAG` set is processed after those without
+- a withdrawn failed tag logs the "partly at `FAIL_TAG`" warning
 - state writes match the table in 6.2 for every outcome
 - unattended policy: overwrite required → `LOCAL_CHANGES`, no pull issued; other decision →
   `NEEDS_DECISION`
@@ -393,7 +445,8 @@ deployer, but does contact the remote, read credentials and write log entries ma
 - private repository with a token, public without; token rejected → authentication failure
 - two registered repositories whose names overlap: only the configured key is touched
 - re-run after a failed pull with the repository already on the target ref → pulls again and is
-  judged against the stored snapshot
+  judged against the stored baseline
+- the scope-1 lock is still held after the pull has finished (see spike item 9.9)
 - two overlapping runs: the second is `SKIPPED` and the lock is still held for the whole pull
 
 ## 8. Source-checked facts about abapGit (read in source, not run live)
@@ -433,6 +486,9 @@ published API, and can change between versions:
 7. Whether changing the selected ref to a tag is honoured when the repository object was built
    earlier in the same process.
 8. Release status of the `SECSTORE_*` function modules for customer use.
+9. Whether anything abapGit or SAP calls during deserialisation releases the scope-1 lock early
+   (for example a function that dequeues every lock of the session). The whole overlap protection
+   in 6.3 depends on it.
 
 ## 10. Repository layout
 
